@@ -1,0 +1,18 @@
+# Core ML stack
+torch>=2.2
+torchvision>=0.17
+ultralytics>=8.3.0        # YOLO + YOLO-World (open-vocab) detection
+open_clip_torch>=2.24     # CLIP/SigLIP image embeddings
+# Note: the first YOLO-World run auto-installs OpenAI's `clip` (its text
+# encoder) via ultralytics. To pre-install it explicitly:
+#   pip install git+https://github.com/openai/CLIP.git
+
+# Vector search: the demo uses an exact NumPy cosine store (see
+# shelf_demo/database.py) to avoid the macOS faiss/torch libomp clash.
+# For real scale swap in FAISS or Milvus:
+#   faiss-cpu>=1.8
+
+# App / utils
+gradio>=4.44              # web UI
+pillow>=10.0
+numpy>=1.26
