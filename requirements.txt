@@ -16,3 +16,14 @@ open_clip_torch>=2.24     # CLIP/SigLIP image embeddings
 gradio>=4.44              # web UI
 pillow>=10.0
 numpy>=1.26
+
+# ---------------------------------------------------------------
+# Eye-in-hand robot stack (docs/plans/2026-08-27-eye-in-hand-design.md)
+# Optional - install ONLY on the robot/calibration host, not for the web demo:
+#   pyrealsense2          # RealSense RGB-D capture (Linux x86 wheel;
+#                         # on Jetson use librealsense from the vendor SDK)
+# Notes:
+#   - opencv ships with ultralytics. cv2 >= 5.0 REMOVED cv2.calibrateHandEye,
+#     so the hand-eye solver is implemented in numpy (calibration.py, Park).
+#   - All SE3 / 3D math (transforms/pose3d/calibration) needs only numpy
+#     and runs headless without camera or arm (scripts/test_*.py).

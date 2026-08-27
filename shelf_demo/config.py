@@ -84,6 +84,23 @@ SEARCH_TOPK = int(_env("SEARCH_TOPK", "5"))
 # ---- Device ----------------------------------------------------------------
 DEVICE = _env("SHELF_DEVICE", "auto")   # auto | cpu | cuda | mps
 
+# ---- Eye-in-hand RGB-D (RealSense + robotic arm) ---------------------------
+# See docs/plans/2026-08-27-eye-in-hand-design.md. Used only by camera.py /
+# pose3d.py / rgbd_live.py; the 2D web demo does not touch any of this.
+RS_WIDTH = int(_env("RS_WIDTH", "1280"))
+RS_HEIGHT = int(_env("RS_HEIGHT", "720"))
+RS_FPS = int(_env("RS_FPS", "30"))
+# Depth beyond this is treated as invalid (RealSense noise grows with range;
+# grasp distances for eye-in-hand are well under 1 m).
+RS_DEPTH_M_MAX = float(_env("RS_DEPTH_M_MAX", "2.5"))
+# Solved hand-eye transform T_ee_cam (4x4, as rotvec+translation JSON),
+# written by scripts/calibrate_handeye.py.
+HANDEYE_PATH = Path(_env("HANDEYE_PATH", str(DATA_DIR / "handeye.json")))
+# Center shrink factor of a detection box when sampling depth for 3D
+# localisation: the box always contains background/corners, so read depth
+# only from its central TARGET3D_ROI_SHRINK x TARGET3D_ROI_SHRINK region.
+TARGET3D_ROI_SHRINK = float(_env("TARGET3D_ROI_SHRINK", "0.4"))
+
 
 def pick_device() -> str:
     if DEVICE != "auto":

@@ -610,6 +610,32 @@ MPS 推理）期间持有——MPS 不接受并发推理。两把锁**绝不嵌�
 
 ---
 
+## 12.5 Eye-in-hand 机械臂抓取（RGB-D 扩展，进行中）
+
+目标形态：机器狗驮机械臂在货架前抓/理商品，深度相机（RealSense）装在腕部。
+设计文档：**`docs/plans/2026-08-27-eye-in-hand-design.md`**。
+识别层（YOLO+CLIP、2D 稳定窗口）完全不动，新增几何层：
+
+| 模块 | 职责 |
+|------|------|
+| `shelf_demo/transforms.py` | SE3 数学：变换链 `P_base = T_base_ee·T_ee_cam·P_cam` |
+| `shelf_demo/camera.py` | RealSense 采帧（深度对齐 RGB、转米、读内参） |
+| `shelf_demo/pose3d.py` | 2D 框 + 深度 → 相机系 3D 目标点（中值滤波） |
+| `shelf_demo/calibration.py` | 手眼标定：纯 numpy Park 解法（cv2≥5 删了 calibrateHandEye） |
+| `shelf_demo/rgbd_live.py` | `RGBDGraspSession.grasp3d(name)` → 米制坐标 |
+| `shelf_demo/robot.py` | `ArmBase` 接口 + `MockArm` |
+
+```bash
+python scripts/test_transforms.py            # SE3 数学自检（秒级，无硬件）
+python scripts/test_rgbd_grasp.py            # 全链路合成数据测试（同上）
+python scripts/calibrate_handeye.py simulate # 手眼解算自检（无硬件）
+python scripts/rs_live.py --target "可乐"     # 上机回路：实时打印目标 3D
+# 臂到货后：collect（采 10+ 组）→ solve → data/handeye.json，
+# rgbd_live 的 point_base_m 随即可用
+```
+
+---
+
 ## 13. 开发与测试
 
 ```bash
