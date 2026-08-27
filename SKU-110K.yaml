@@ -1,11 +1,11 @@
 # SKU-110K dataset (dense shelf products, single class "object").
-# Local copy lives in ./datasets/SKU-110K (already extracted).
-# Splits are image-list files; ultralytics derives labels by mapping
-# images/<name>.jpg -> labels/<name>.txt.
+# Local copy: ./datasets/SKU-110K (extracted from datasets/SKU.zip)
+#   images/{train,val,test}/   8219 / 588 / 2936 high-res shelf photos
+#   labels/{train,val,test}/   YOLO-format .txt (class cx cy w h)
 path: datasets/SKU-110K
-train: train.txt
-val: val.txt
-test: test.txt
+train: images/train
+val: images/val
+test: images/test
 
 names:
   0: object
