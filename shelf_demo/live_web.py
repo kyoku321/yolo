@@ -60,6 +60,28 @@ LIVE_HTML = """
       <span class="slv-val" data-role="thr-val"></span>
     </label>
   </div>
+  <div class="slv-controls slv-3drow">
+    <label class="slv-row">
+      <input type="checkbox" data-role="sd3d" />
+      <span class="slv-name">3D coordinates (synthetic depth plane)</span>
+    </label>
+    <label class="slv-row">
+      <span class="slv-name">Target name</span>
+      <input type="text" data-role="sd3d-name" class="slv-txt"
+             placeholder="e.g. OBSBOT TINY" />
+    </label>
+    <label class="slv-row">
+      <span class="slv-name">Depth (m)</span>
+      <input type="number" data-role="sd3d-depth" class="slv-num"
+             value="0.35" step="0.05" min="0.1" max="3" />
+    </label>
+    <label class="slv-row">
+      <span class="slv-name">HFOV (deg)</span>
+      <input type="number" data-role="sd3d-hfov" class="slv-num"
+             value="69" step="1" min="30" max="120" />
+    </label>
+  </div>
+  <pre class="slv-3dout" data-role="sd3d-out">3D: auto-enabled for RealSense cameras - every detected object gets cam(x y z); set the target name to lock one for GRASP READY</pre>
   <pre class="slv-summary" data-role="summary">Recognition summary will appear here</pre>
 </div>
 """
@@ -109,6 +131,21 @@ LIVE_CSS = """
   border-radius: 8px; font-family: ui-monospace, monospace; font-size: 12.5px;
   white-space: pre-wrap;
 }
+.slv-3drow { margin-top: 6px; padding-top: 8px; border-top: 1px dashed #1e293b; }
+.slv-txt {
+  background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+  border-radius: 6px; padding: 3px 6px; width: 170px;
+}
+.slv-num {
+  background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+  border-radius: 6px; padding: 3px 6px; width: 64px;
+}
+.slv-3dout {
+  margin: 6px 0 0; padding: 8px 12px; min-height: 26px;
+  background: #0f172a; color: #94a3b8; border-radius: 8px;
+  font-family: ui-monospace, monospace; font-size: 12.5px;
+}
+.slv-3dout.on { color: #fbbf24; }
 """
 
 
@@ -135,6 +172,13 @@ def live_js() -> str:
   var confVal = root.querySelector('[data-role="conf-val"]');
   var thrVal = root.querySelector('[data-role="thr-val"]');
   var camSel = root.querySelector('[data-role="camera"]');
+  var sdChk = root.querySelector('[data-role="sd3d"]');
+  var sdName = root.querySelector('[data-role="sd3d-name"]');
+  var sdDepth = root.querySelector('[data-role="sd3d-depth"]');
+  var sdHfov = root.querySelector('[data-role="sd3d-hfov"]');
+  var sdOut = root.querySelector('[data-role="sd3d-out"]');
+  var last3d = null;
+  var last3dMap = {};
 
   var DEF_CONF = __DEF_CONF__, DEF_THR = __DEF_THR__;
   confRange.value = String(DEF_CONF); thrRange.value = String(DEF_THR);
@@ -160,6 +204,7 @@ def live_js() -> str:
       });
       var ids = cams.map(function (d) { return d.deviceId; });
       if (ids.indexOf(keepId) >= 0) camSel.value = keepId;
+      sync3dAuto();
     }).catch(function () {});
   }
   refreshCameraList();
@@ -168,7 +213,85 @@ def live_js() -> str:
         function () { refreshCameraList(); });
   }
 
+  // 3D panel: auto-enabled only for RealSense cameras (label match) - those
+  // are the ones for which the synthetic depth plane has physical meaning.
+  // Any other camera (e.g. FaceTime) stays 2D; the user can still override
+  // the checkbox manually.
+  function selectedCamLabel() {
+    var opt = camSel.options[camSel.selectedIndex];
+    return opt ? opt.textContent : "";
+  }
+  function isRealSenseCam() {
+    return /realsense/i.test(selectedCamLabel());
+  }
+  function sync3dAuto() {
+    var rs = isRealSenseCam();
+    sdChk.checked = rs;
+    if (!rs) {
+      last3d = null;
+      sdOut.classList.remove("on");
+      sdOut.textContent = "3D disabled: '" + selectedCamLabel() +
+        "' is not a RealSense camera (2D mode)";
+    } else {
+      sdOut.classList.add("on");
+      sdOut.textContent = "3D enabled for " + selectedCamLabel() +
+        " - enter the target name; D435i RGB HFOV ~ 69, set the depth plane " +
+        "(m) to the target distance";
+    }
+  }
+
+  function poll3d() {
+    if (!running || !sdChk.checked) return;
+    var nm = sdName.value ? sdName.value.trim() : "";
+    var gen = generation;
+    fetch(API + "/simdepth?uuid=" + encodeURIComponent(SESSION) +
+          "&name=" + encodeURIComponent(nm) +
+          "&depth=" + encodeURIComponent(sdDepth.value || "0.35") +
+          "&hfov=" + encodeURIComponent(sdHfov.value || "69"))
+      .then(function (r) { return r.json(); })
+      .then(function (resp) {
+        if (gen !== generation || !running) return;
+        if (!(resp && resp.ok)) return;
+        last3d = resp;
+        var m3 = {};
+        if (resp.points) {
+          for (var i = 0; i < resp.points.length; i++) {
+            var pt = resp.points[i];
+            if (pt.point_cam_m) m3[pt.id] = pt.point_cam_m;
+          }
+        }
+        last3dMap = m3;
+        var line;
+        if (nm && resp.point_cam_m) {
+          var p = resp.point_cam_m;
+          line = nm + "  cam=[" + p[0] + "  " + p[1] + "  " + p[2] + "] m";
+          if (resp.point_ee_m) {
+            var q = resp.point_ee_m;
+            line += "   ee=[" + q[0] + "  " + q[1] + "  " + q[2] + "] m";
+          }
+          line += (resp.stable
+            ? "   GRASP READY (" + resp.frames_stable + "/" +
+              resp.stable_window + ")"
+            : "   stable " + (resp.frames_stable || 0) + "/" +
+              resp.stable_window);
+        } else if (nm) {
+          line = nm + "  " + (resp.reason || "waiting for frame");
+        } else if (resp.points) {
+          line = "3D: " + resp.points.length +
+            " object(s) @ " + (sdDepth.value || "0.35") +
+            " m plane, hfov " + (sdHfov.value || "69") +
+            " - set a target name to lock one for GRASP READY";
+        } else {
+          line = "3D: " + (resp.reason || "waiting for frame");
+        }
+        sdOut.textContent = line;
+      })
+      .catch(function () {});
+  }
+  window.setInterval(poll3d, 600);
+
   camSel.onchange = function () {
+    sync3dAuto();
     if (!running) return;   // applies on next Start
     // hot-switch while running: release the old track and reopen
     if (media) {
@@ -268,6 +391,31 @@ def live_js() -> str:
       ctx.fillRect(x1, ty, tw + 8, fontH + 6);
       ctx.fillStyle = "#ffffff";
       ctx.fillText(label, x1 + 4, ty + fontH + 1);
+      var p3a = last3dMap ? last3dMap[b.id] : null;
+      if (p3a) {
+        var t3a = "cam(" + p3a[0].toFixed(3) + " " + p3a[1].toFixed(3) +
+                  " " + p3a[2].toFixed(3) + ")";
+        var w3a = ctx.measureText(t3a).width;
+        var ty3a = Math.min(vh - 4, y2 + fontH + 8);
+        ctx.fillStyle = "#facc15";
+        ctx.fillRect(x1, ty3a - fontH - 2, w3a + 8, fontH + 6);
+        ctx.fillStyle = "#111827";
+        ctx.fillText(t3a, x1 + 4, ty3a - 2);
+      }
+    }
+    if (last3d && last3d.box && last3d.point_cam_m) {
+      var b3 = last3d.box;
+      var x1b = b3[0] * sx, y1b = b3[1] * sx;
+      var x2b = b3[2] * sx, y2b = b3[3] * sx;
+      var p3 = last3d.point_cam_m;
+      var t3 = "cam(x=" + p3[0].toFixed(3) + "  y=" + p3[1].toFixed(3) +
+               "  z=" + p3[2].toFixed(3) + " m)";
+      var w3 = ctx.measureText(t3).width;
+      var ty3 = Math.min(vh - 4, y2b + fontH + 8);
+      ctx.fillStyle = "#facc15";
+      ctx.fillRect(x1b, ty3 - fontH - 2, w3 + 8, fontH + 6);
+      ctx.fillStyle = "#111827";
+      ctx.fillText(t3, x1b + 4, ty3 - 2);
     }
   }
 
@@ -304,9 +452,14 @@ def live_js() -> str:
       if (resp && resp.ok) {
         lastBoxes = resp.boxes;
         lastImgW = resp.img_w; lastImgH = resp.img_h;
+        // Which detector produced these boxes: the trained SKU-110K model
+        // (dense shelves) or the YOLO-World fallback (close-up product).
+        var detName = resp.detector === "world" ? "YOLO-World"
+                    : (resp.detector === "custom" ? "SKU-110K" : resp.detector);
         setStatus(resp.fps + " FPS · " + resp.n_objects + " objects · "
           + resp.n_matched + " matched · server " + resp.ms + "ms"
-          + (resp.n_new ? " · " + resp.n_new + " new objects" : ""));
+          + (resp.n_new ? " · " + resp.n_new + " new objects" : "")
+          + (detName ? " · model " + detName : ""));
         if (resp.summary !== null && resp.summary !== undefined) {
           sumEl.textContent = resp.summary;
         }
@@ -355,6 +508,7 @@ def live_js() -> str:
       btnToggle.classList.remove("stop");
       hint.style.display = "flex";
       lastBoxes = []; lastImgW = 0; lastImgH = 0;
+      last3d = null; last3dMap = {};
       canvas.width = 0; canvas.height = 0;
       setStatus("Stopped");
     }

@@ -23,9 +23,10 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from shelf_demo import config                       # noqa: E402
-from shelf_demo.detector import Detector            # noqa: E402
+from shelf_demo.detector import build_detector      # noqa: E402
 from shelf_demo.embedder import Embedder            # noqa: E402
 from shelf_demo.database import Catalog             # noqa: E402
+from shelf_demo.pipeline import rank_boxes          # noqa: E402
 from shelf_demo.draw import _font                   # noqa: E402
 from PIL import ImageDraw                            # noqa: E402
 
@@ -34,7 +35,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
     ap.add_argument("--detector", default=None,
-                    help="coco | world | custom (default: config.DETECTOR)")
+                    help="auto | coco | world | custom (default: config.DETECTOR)")
     ap.add_argument("--conf", type=float, default=config.DETECT_CONF)
     ap.add_argument("--imgsz", type=int, default=config.DETECT_IMGSZ,
                     help="inference size; raise to 1920+ for 4K dense shelves")
@@ -43,7 +44,7 @@ def main() -> None:
     image = Image.open(args.image).convert("RGB")
     print(f"Image: {args.image}  size={image.size}")
 
-    det = Detector(detector=args.detector)
+    det = build_detector(args.detector)
     print(f"Detector kind = {det.kind}  weights = {det.weights}")
     if det.prompts:
         print(f"Open-vocab prompts = {det.prompts}")
@@ -51,11 +52,14 @@ def main() -> None:
     # --- stage 1: detection ------------------------------------------------
     boxes = det.detect(image, conf=args.conf, imgsz=args.imgsz)
     print(f"\n[STAGE 1] DETECTION: {len(boxes)} boxes "
-          f"at imgsz={args.imgsz}, conf>={args.conf}")
+          f"at imgsz={args.imgsz}, conf>={args.conf}"
+          f"  (path: {getattr(det, 'last_path', det.kind)})")
     if not boxes:
         print("  -> 0 boxes. This is your problem: the detector finds nothing.")
         print("     Fixes: raise --imgsz (e.g. 1920 for 4K photos), lower")
         print("     --conf (e.g. 0.02), or train a custom SKU-110K detector.")
+        print("     For a single product held close to the camera, keep the")
+        print("     default --detector auto (specialist + open-vocab fallback).")
         return
 
     # annotate every raw box (independent of retrieval)
@@ -78,16 +82,14 @@ def main() -> None:
         return
 
     emb = Embedder()
-    crops = [b.crop(image) for b in boxes]
-    embs = emb.embed(crops)
-    hits = cat.search(embs, topk=1)
-
+    ranked_all = rank_boxes(cat, emb, image, boxes)
     print(f"\n[STAGE 2] RETRIEVAL vs {cat.n_vectors} catalog vectors "
-          f"(match threshold = {config.MATCH_THRESHOLD}):")
+          f"(match threshold = {config.MATCH_THRESHOLD}, "
+          f"crop scales = {config.MATCH_SCALES}):")
     scored = []
-    for i, hit in enumerate(hits):
-        if hit:
-            sku_id, score = hit[0]
+    for i, ranked in enumerate(ranked_all):
+        if ranked:
+            sku_id, score = ranked[0]
             p = cat.get(sku_id)
             scored.append((score, i, p.name if p else "?"))
     scored.sort(reverse=True)

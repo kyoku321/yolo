@@ -104,6 +104,20 @@ def register_api_routes(app) -> None:
         return await asyncio.to_thread(
             shelf_live.handle_grasp, {"uuid": uuid, "name": name}, pipeline())
 
+    @app.get("/live/api/simdepth")
+    async def live_simdepth(uuid: str = "", name: str = "",
+                            depth: float = 0.35, hfov: float = 69.0):
+        """Camera-frame 3D for a product name via a synthetic depth plane.
+
+        Poll this while the Live camera runs on a 3D camera (e.g. RealSense
+        D435i RGB over UVC). `depth` is the constant metres plane the target
+        sits on; `hfov` is the camera's horizontal field of view in degrees.
+        """
+        return await asyncio.to_thread(
+            shelf_live.handle_simdepth,
+            {"uuid": uuid, "name": name, "depth": depth, "hfov": hfov},
+            pipeline())
+
     @app.get("/catalog/api/list")
     async def catalog_list():
         return await asyncio.to_thread(catalog_api.list_catalog, pipeline())
@@ -199,6 +213,7 @@ if __name__ == "__main__":
     d, e = p.detector, p.embedder
     _kind_label = {"custom": "SKU-110K 自训权重",
                    "world": "YOLO-World 零样本（文本 prompt）",
+                   "auto": "自训权重 + 零样本兜底（密集货架/单品特写自适应）",
                    "coco": "COCO 80 类（检不出零食/饮料）"}
     print()
     print("=" * 62)
@@ -207,7 +222,13 @@ if __name__ == "__main__":
     print(f"  检测器 Detector  : {d.kind} — {_kind_label.get(d.kind, '')}")
     print(f"      权重 weights : {d.weights}")
     print(f"      设备 device  : {d.device}")
-    if d.prompts:   # world 模式才有的 prompt 列表
+    if d.kind == "auto":
+        # Load the open-vocab fallback now, not inside the first cam slab of
+        # frames — YOLO-World init is seconds, and a live session must not
+        # stall on it. See AutoDetector.
+        print("      兜底 fallback: 已预热 (YOLO-World)，单品特写时自动启用")
+        d.warm()
+    if d.prompts:
         print(f"      prompts      : {', '.join(d.prompts)}")
     print(f"  嵌入 CLIP        : {e.model_name} / {e.pretrained}")
     print(f"      维度 dim     : {e.dim}    设备 device: {e.device}")

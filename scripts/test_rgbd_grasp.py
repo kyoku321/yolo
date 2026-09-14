@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from shelf_demo import live as L
+from shelf_demo import config, live as L
 from shelf_demo.camera import Frame
 from shelf_demo.detector import Box
 from shelf_demo.pipeline import Recognition
@@ -80,13 +80,15 @@ def main() -> int:
     arm = MockArm(T_BASE_EE)
     sess = RGBDGraspSession(_FakePipeline(), arm=arm, T_ee_cam=T_EE_CAM)
 
-    n_feed = L.GRASP_WINDOW + 1
+    # CONFIRM_FRAMES frames to confirm the SKU, then GRASP_WINDOW stable
+    # frames; +2 of margin above theory
+    n_feed = config.CONFIRM_FRAMES + L.GRASP_WINDOW + 2
     for _ in range(n_feed):
         sess.process_frame(make_frame(0.6))
 
     res = sess.grasp3d("Cola")
-    check("grasp3d ready after stable frames", res["ready"] is True,
-          res.get("reason", ""))
+    check("grasp3d ready after confirm + stable frames",
+          res["ready"] is True, res.get("reason", ""))
     check("arm FK queried exactly once per frame (not cached)",
           arm.fk_calls == n_feed, str(arm.fk_calls))
 

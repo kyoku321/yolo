@@ -41,19 +41,27 @@ class Embedder:
         return self.torch.no_grad()
 
     def embed(self, images: list[Image.Image]) -> np.ndarray:
-        """Return an (N, dim) float32 array of L2-normalized embeddings."""
+        """Return an (N, dim) float32 array of L2-normalized embeddings.
+
+        Large inputs (hundreds of shelf crops x MATCH_SCALES) are chunked into
+        EMBED_BATCH_SIZE forward passes so peak memory stays bounded.
+        """
         if not images:
             return np.zeros((0, self.dim), dtype=np.float32)
 
-        batch = self.torch.stack(
-            [self.preprocess(img.convert("RGB")) for img in images]
-        ).to(self.device)
-
-        with self.torch.no_grad():
-            feats = self.model.encode_image(batch)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
-
-        return feats.detach().cpu().float().numpy().astype(np.float32)
+        chunk = max(1, int(config.EMBED_BATCH_SIZE))
+        parts: list[np.ndarray] = []
+        for start in range(0, len(images), chunk):
+            batch = self.torch.stack([
+                self.preprocess(img.convert("RGB"))
+                for img in images[start:start + chunk]
+            ]).to(self.device)
+            with self.torch.no_grad():
+                feats = self.model.encode_image(batch)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+            parts.append(
+                feats.detach().cpu().float().numpy().astype(np.float32))
+        return np.concatenate(parts, axis=0)
 
     def embed_one(self, image: Image.Image) -> np.ndarray:
         return self.embed([image])[0]
