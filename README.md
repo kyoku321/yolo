@@ -1,609 +1,607 @@
-# 🛒 超市货架商品识别 Demo
-
-给新人写的完整文档：先讲清楚**原理和架构**，再讲**怎么跑起来**，最后讲
-**怎么训练 SKU-110K 检测器**和**怎么调试**。
+# 🛒 スーパーの棚の商品認識 Demo
+**SKU-110K デテクタのトレーニング方法**と**デバッグ方法**を順に説明する。
 
 ---
 
-## 1. 这是什么？
+## 1. これは何？
 
-输入一张货架照片，输出**每个商品的位置框 + 商品名**（以及价格、条码等元数据）：
+棚の写真を入力すると、**各商品の位置ボックス＋商品名**（価格・バーコードなどのメタデータ付き）を出力する：
 
 ```
-货架照片 ──► YOLO 检测出 N 个商品框 ──► 逐框裁剪
+棚の写真 ──► YOLO が N 個の商品ボックスを検出 ──► ボックスごとにクロップ
                                           │
-                              CLIP 把每张裁剪图变成 512 维向量
+                              CLIP が各クロップを 512 次元ベクトルに変換
                                           │
-                              和「商品库」里的向量比余弦相似度
+                              「商品DB」内のベクトルとコサイン類似度を比較
                                           │
-                                命中 → 显示商品名 / 不命中 → Unknown
+                                ヒット → 商品名を表示 / ミス → Unknown
 ```
 
-这就是业界主流的 **检索式（retrieval-based）商品识别**方案（SKU-110K /
-coarse-to-fine 论文的思路）：
+これは業界の主流である**検索ベース（retrieval-based）の商品認識**方式
+（SKU-110K / coarse-to-fine 論文の発想）：
 
-- **检测**（YOLO）只回答「哪里有商品」，是一个**单类别**问题；
-- **识别**（CLIP + 向量检索）回答「这是哪个 SKU」，是一个**检索**问题。
+- **検出**（YOLO）は「どこに商品があるか」だけ答え、**単一クラス**の問題；
+- **認識**（CLIP + ベクトル検索）は「これはどの SKU か」答え、**検索**の問題。
 
-**核心优势**：上新一个商品，只需在 Web 页面上传 1–5 张参考照片入库，
-**不用重训任何模型**。这正是检索式方案在零售业成为事实标准的原因。
+**コアの利点**：新商品を扱う場合は、Web ページで参照写真 1–5 枚をアップロードして登録するだけでよく、
+**どのモデルも再学習しなくていい**。これが検索ベース方式が小売業界で事実上の標準になった理由だ。
 
-### 新人必须先懂的 5 个概念
+### 初心者が必ず押さえるべき 5 つの概念
 
-| 概念 | 一句话解释 |
+| 概念 | 一言で説明 |
 |------|-----------|
-| **embedding（向量）** | CLIP 把任意一张图变成一个 512 维数字向量。长得像的图，向量也接近。注册和识别用**同一个** CLIP 模型，所以向量在同一个「空间」里可以比。 |
-| **余弦相似度** | 两个向量夹角的小数表示，0~1（本项目向量都做了 L2 归一化，所以点积 = 余弦）。≥ `MATCH_THRESHOLD`（默认 0.65）才算「认出」，否则显示 Unknown。 |
-| **IoU** | 两个框重叠面积 ÷ 并集面积。NMS 用它去重，实时跟踪用它判断「这个框和上一帧的哪个目标是不是同一个商品」。 |
-| **NMS（非极大值抑制）** | 检测器经常对同一个商品打出好几个几乎重合的框，NMS 按 IoU 阈值把重复框压掉。 |
-| **开放词表检测（YOLO-World）** | 不训练、靠文字提示词（"bottle", "package"…）检测任意物体的检测器。零训练可用，但框偏松。 |
+| **embedding（ベクトル）** | CLIP は任意の画像を 512 次元の数値ベクトルに変換する。見た目類似の画像はベクトルも近くなる。登録と認識は**同じ** CLIP モデルを使うので、ベクトルは同じ「空間」にあり比較できる。 |
+| **コサイン類似度** | 2 つのベクトルの挟角を表す 0~1 の小数（本プロジェクトのベクトルは全て L2 正規化済みなので、内積 = コサイン）。`MATCH_THRESHOLD`（デフォルト 0.65）以上で「認識した」扱い、それ以外は Unknown と表示。 |
+| **IoU** | 2 つのボックスの重複面積 ÷ 和集合面積。NMS はこれで重複除去し、リアルタイム追跡はこれで「このボックスは前フレームのどのターゲットと同一商品か」を判断する。 |
+| **NMS（非最大値抑制）** | デテクタは同じ商品にほぼ重なる複数ボックスを出しがち。NMS は IoU 閾値に従って重複ボックスを潰す。 |
+| **オープンボキャブラリ検出（YOLO-World）** | 学習なしにテキストプロンプト（"bottle", "package"…）で任意の物体を検出するデテクタ。ゼロ学習で使えるが、ボックスは緩めになりがち。 |
 
 ---
 
-## 2. 总体架构
+## 2. 全体アーキテクチャ
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ 浏览器（Gradio Web UI，http://127.0.0.1:7860）                          │
+│ ブラウザ（Gradio Web UI, http://127.0.0.1:7860）                       │
 │                                                                        │
-│  Tab 1 Register    Tab 2 Recognize   Tab 3 Live        Tab 4 Catalog  │
-│  上传参考图入库     上传货架图识别    摄像头实时标注     商品库表格管理   │
-│  (Gradio 表单)     (Gradio 表单)    (自研 HTML/JS)    (自研 HTML/JS)   │
-└───────┬──────────────────┬─────────────────┬──────────────────┬────────┘
-        │                  │                 │ JSON over HTTP   │ JSON over HTTP
-        │                  │            POST /live/api/frame  GET /catalog/api/list
-        │                  │            POST /live/api/reset  POST /catalog/api/delete
-        │                  │            GET  /live/api/grasp
-        ▼                  ▼           （机械臂抓取就绪接口）
+│   Tab 1 Register        Tab 2 Recognize   Tab 3 Live     Tab 4 Catalog │
+│    参考画像登録          棚画像認識       カメラ実時間   カタログ管理  │
+│   Gradio フォーム       Gradio フォーム   自作 HTML/JS   自作 HTML/JS  │
+└───────┬───────────────┬────────────────┬──────────────┬────────────────┘
+                │               │               │  JSON over HTTP               │  JSON over HTTP
+                │               │               │  POST /live/api/frame               │  GET /catalog/api/list
+                │               │               │  POST /live/api/reset               │  POST /catalog/api/delete
+                │               │               │  GET  /live/api/grasp               │
+                │               │               │               │  （ロボットアームの grasp 準備 API）
+│                ▼               ▼               ▼               ▼       │
 ┌────────────────────────────────────────────────────────────────────────┐
-│ app.py — Gradio Blocks + FastAPI 路由（重模型懒加载，主线程预热）         │
-└───────┬──────────────────┬─────────────────┬──────────────────┬────────┘
-        │                  │                 │                  │
-        ▼                  ▼                 ▼                  ▼
+│ app.py — Gradio Blocks + FastAPI ルーティング                          │
+│ （重いモデルは遅延ロード、メインスレッドでウォームアップ）             │
+└───────┬───────────────┬────────────────┬──────────────┬────────────────┘
+                │               │               │               │
+│                ▼               ▼               ▼               ▼       │
 ┌────────────────────────────────────────────────────────────────────────┐
-│ shelf_demo/pipeline.py  —  ShelfPipeline（端到端编排，唯一入口）          │
-│   register_product()   recognize()   match_boxes()   delete_product()  │
-│  ┌──────────────┬───────────────┬──────────────────────┬────────────┐  │
-│  ▼              ▼               ▼                      ▼            │  │
-│ detector.py  embedder.py   database.py              crop 文件管理    │  │
-│ YOLO 检测     CLIP 向量     SQLite 元数据            data/crops/     │  │
-│ (3 种后端)    (512维)        + NumPy 向量库                              │  │
-│                                        data/catalog.sqlite            │  │
-│                                        data/vectors.npz               │  │
-│  live.py  —  LiveRecognizer（ByteTrack 跟踪 + 多帧表决 + 定期复核 ）      │  │
-│  live_web.py / catalog_web.py — 自研前端模板（HTML/CSS/JS）            │  │
-│  catalog_api.py — Catalog 页 JSON handler                            │  │
-│  draw.py — 画框/摘要    config.py — 全部配置（env 可覆盖）              │  │
+│ shelf_demo/pipeline.py — ShelfPipeline                                 │
+│ （エンドツーエンドのオーケストレーション、唯一のエントリ）             │
+│ register_product()   recognize()   match_boxes()   delete_product()    │
+│  ┌───────────────┬───────────────┬──────────────────────┬────────────┐  │
+│  │ ▼             │ ▼             │ ▼                    │ ▼          │  │
+│  │ detector.py   │ embedder.py   │ database.py          │ crop 管理  │  │
+│  │ YOLO 検出     │ CLIP ベクトル │ SQLite メタデータ    │ data/crops/ │  │
+│  │ 3 種バックエンド │ (512 次元)    │ + NumPy ベクトルDB   │            │  │
+│                                                 data/catalog.sqlite         │
+│                                                 data/vectors.npz             │
+│ live.py — LiveRecognizer（ByteTrack 追跡 + マルチフレーム投票 + 定期再確認）│
+│ live_web.py / catalog_web.py — 自作フロントエンドテンプレート（HTML/CSS/JS）│
+│ catalog_api.py — Catalog ページの JSON handler                         │
+│ draw.py — 枠線/サマリー描画    config.py — 全設定（env で上書き可）    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-**一句话总结模块职责**：
+**モジュールの責務を一言で**：
 
-| 模块 | 职责 |
+| モジュール | 責務 |
 |------|------|
-| `shelf_demo/config.py` | 所有可调参数（路径/检测/CLIP/检索/设备），全部可用环境变量覆盖 |
-| `shelf_demo/detector.py` | `Detector` / `AutoDetector`：封装 YOLO 推理，输出 `Box(x1,y1,x2,y2,conf)` 列表。后端：`auto` / `custom` / `world` / `coco` |
-| `shelf_demo/embedder.py` | `Embedder`：open_clip 图像编码器，图片 → L2 归一化的 (N, 512) 向量 |
-| `shelf_demo/database.py` | `Catalog`：SQLite 存 SKU 元数据 + `VectorStore`（NumPy 精确余弦近邻）存向量。`add / search / delete` |
-| `shelf_demo/pipeline.py` | `ShelfPipeline`：把上面三块串起来。注册、识别、删除都从这里进出 |
-| `shelf_demo/live.py` | 实时识别：`LiveRecognizer`（ByteTrack 跟踪器 + 时序表决）+ 会话管理 + 帧 JSON 处理 |
-| `shelf_demo/live_web.py` | Live 页前端（canvas 画框、getUserMedia 抓帧、参数滑杆） |
-| `shelf_demo/catalog_api.py` / `catalog_web.py` | Catalog 页后端 JSON handler / 前端表格 |
-| `shelf_demo/draw.py` | 识别结果画框（绿=命中，红=Unknown）+ 文本摘要 |
-| `app.py` | Gradio UI 4 个 Tab + FastAPI 自定义路由挂载 |
-| `scripts/` | 训练（§8）、调试（§9）、端到端测试（§13）脚本 |
+| `shelf_demo/config.py` | すべての調整可能パラメータ（パス/検出/CLIP/検索/デバイス）、全て環境変数で上書き可能 |
+| `shelf_demo/detector.py` | `Detector` / `AutoDetector`：YOLO 推論をラップし、`Box(x1,y1,x2,y2,conf)` のリストを出力。バックエンド：`auto` / `custom` / `world` / `coco` |
+| `shelf_demo/embedder.py` | `Embedder`：open_clip 画像エンコーダ、画像 → L2 正規化済み (N, 512) ベクトル |
+| `shelf_demo/database.py` | `Catalog`：SQLite に SKU メタデータを保存 + `VectorStore`（NumPy による厳密なコサイン近傍探索）にベクトルを保存。`add / search / delete` |
+| `shelf_demo/pipeline.py` | `ShelfPipeline`：上記 3 ブロックを繋ぐ。登録・認識・削除はいずれもここで入出する |
+| `shelf_demo/live.py` | リアルタイム認識：`LiveRecognizer`（ByteTrack トラッカー + 時系列投票）+ セッション管理 + フレーム JSON の処理 |
+| `shelf_demo/live_web.py` | Live ページのフロントエンド（canvas による枠描画、getUserMedia によるフレーム取得、パラメータスライダー） |
+| `shelf_demo/catalog_api.py` / `catalog_web.py` | Catalog ページのバックエンド JSON ハンドラ / フロントエンドのテーブル |
+| `shelf_demo/draw.py` | 認識結果の枠描画（緑=ヒット、赤=Unknown）+ テキストサマリー |
+| `app.py` | Gradio UI の 4 タブ + FastAPI カスタムルートのマウント |
+| `scripts/` | トレーニング（§8）、デバッグ（§9）、エンドツーエンドテスト（§13）のスクリプト |
 
 ---
 
-## 3. 目录结构
+## 3. ディレクトリ構造
 
 ```
 yolo/
-├── app.py                    # Web 入口：Gradio 4 个 Tab + FastAPI 路由
+├── app.py                    # Web エントリ：Gradio 4 タブ + FastAPI ルート
 ├── requirements.txt
-├── yolov8n.pt                # COCO 预训练权重（6 MB，coco 后端用）
-├── yolov8s-worldv2.pt        # YOLO-World 权重（25 MB，world 后端用）
+├── yolov8n.pt                # COCO 事前学習ウェイト（6 MB、coco バックエンド用）
+├── yolov8s-worldv2.pt        # YOLO-World ウェイト（25 MB、world バックエンド用）
 ├── weights/
-│   ├── sku110k_best.pt       # ★ 本项目在 SKU-110K 上训练的单类别检测器（存在则自动启用）
-│   └── clip/ViT-B-32.pt      # 预下载的 CLIP 权重（默认 CLIP 是 ViT-B-16，首次运行自动下载）
-├── shelf_demo/               # 核心代码（见 §2 职责表）
+│   ├── sku110k_best.pt       # ★ 本プロジェクトが SKU-110K で学習した単一クラスデテクタ（存在すれば自動有効化）
+│   └── clip/ViT-B-32.pt      # 事前ダウンロード済みの CLIP ウェイト（デフォルト CLIP は ViT-B-16 で初回実行時に自動ダウンロード）
+├── shelf_demo/               # コアコード（§2 の責務表参照）
 │   ├── config.py  detector.py  embedder.py  database.py
 │   ├── pipeline.py  live.py  draw.py
 │   ├── live_web.py  catalog_api.py  catalog_web.py
 ├── scripts/
-│   ├── train_sku110k.py      # ★ 训练 SKU-110K 货架检测器（见 §8）
-│   ├── smoke_test.py         # 无界面端到端自检
-│   ├── debug_detect.py       # 「检测不到商品」分阶段诊断
-│   ├── compare_detectors.py  # custom vs YOLO-World 框质量对比图
-│   ├── sweep_detect.py       # imgsz/conf/NMS-iou 参数扫描
-│   ├── test_grasp.py         # 抓取就绪接口（机械臂）单测，无模型秒跑
-│   ├── e2e_live_ui.py        # [dev] Live 页 Playwright 端到端测试
-│   └── e2e_catalog_ui.py     # [dev] Catalog 页 Playwright 端到端测试
-├── datasets/SKU-110K/        # 训练数据（train.txt 8219 / val 588 / test 2936，单类 object）
-├── runs/detect/...           # 训练产物（loss 曲线、best.pt 等）
-├── data/                     # 运行期数据（见 §7）
-└── docs/plans/               # 设计文档（实时视频标注的演进记录）
+│   ├── train_sku110k.py      # ★ SKU-110K 棚デテクタの学習（§8 参照）
+│   ├── smoke_test.py         # GUI なしで実行するエンドツーエンド自己チェック
+│   ├── debug_detect.py       # 「商品が検出されない」段階別診断
+│   ├── compare_detectors.py  # custom vs YOLO-World のボックス品質比較図
+│   ├── sweep_detect.py       # imgsz/conf/NMS-iou のパラメータスウィープ
+│   ├── test_grasp.py         # grasp 準備インターフェース（ロボットアーム）の単体テスト、モデル不要で秒オーダー
+│   ├── e2e_live_ui.py        # [dev] Live ページの Playwright E2E テスト
+│   └── e2e_catalog_ui.py     # [dev] Catalog ページの Playwright E2E テスト
+├── datasets/SKU-110K/        # 学習データ（train.txt 8219 / val 588 / test 2936、単一クラス object）
+├── runs/detect/...           # 学習成果物（loss カーブ、best.pt など）
+├── data/                     # 実行時データ（§7 参照）
+└── docs/plans/               # 設計ドキュメント（リアルタイム動画注釈の進化記録）
 ```
 
 ---
 
-## 4. 快速开始
+## 4. クイックスタート
 
 ```bash
-# 1. 环境（建议 Python 3.12）
+# 1. 環境（Python 3.12 推奨）
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# 注：首次运行时 ultralytics 会自动补装 YOLO-World 需要的 openai CLIP 文本编码器
+# 注：初回実行時に ultralytics が YOLO-World が必要な openai CLIP テキストエンコーダを自動で補装する
 
-# 2. 自检（只验证「注册→检索」闭环，不需要检测器/摄像头；首次会下载 CLIP 权重 ~600 MB）
+# 2. 自己チェック（「登録→検索」の閉ループのみ検証。デテクタ/カメラ不要。初回は CLIP ウェイト ~600 MB をダウンロード）
 python scripts/smoke_test.py
 
-# 3. 启动 Web UI
-python app.py            # 打开 http://127.0.0.1:7860
+# 3. Web UI を起動
+python app.py            # http://127.0.0.1:7860 を開く
 ```
 
-启动时会在**主线程**预热 YOLO + CLIP 模型（MPS/torch 的原生初始化不适合放在
-Gradio 工作线程里），之后 UI 秒开、识别不卡。
+起動時に YOLO + CLIP モデルを**メインスレッド**でウォームアップする（MPS/torch のネイティブ初期化は
+Gradio のワーカースレッドに向いていない）。その後 UI はすぐ開き、認識も滞らない。
 
-**使用流程**：
+**使用フロー**：
 
-1. **Tab 1 · Register**：上传商品正面图 1–5 张 + 名称（必填）/价格/条码/类目 → 入库。
-2. **Tab 2 · Recognize**：上传货架照片 → 左侧出画框结果图（绿框=认出，红框=Unknown），右侧出数量统计。可调 imgsz / conf / 匹配阈值。
-3. **Tab 3 · Live**：点 Start 授权摄像头，对准货架 → 实时画框 + 商品名跟随画面。可调摄像头、检测分辨率、conf、阈值；Re-recognize 强制全量重识别。
-4. **Tab 4 · Catalog**：表格查看所有 SKU（含注册照片缩略图，点击放大），每行 Delete 删除该 SKU（向量 + 元数据 + 照片文件一起清掉）。
+1. **Tab 1 · Register**：商品の正面写真 1–5 枚 + 名称（必須）/価格/バーコード/カテゴリ をアップロード → 登録。
+2. **Tab 2 · Recognize**：棚写真をアップロード → 左側に枠付きの結果画像（緑枠=認識、赤枠=Unknown）、右側に数量統計。imgsz / conf / マッチ閾値を調整可能。
+3. **Tab 3 · Live**：Start をクリックしてカメラ権限を許可し、棚に向けて → リアルタイム枠描画 + 商品名が映像を追従。カメラ、検出解像度、conf、閾値を調整可能。Re-recognize で全量再認識を強制。
+4. **Tab 4 · Catalog**：テーブルで全 SKU を閲覧（登録写真のサムネイル付き、クリックで拡大）。各行の Delete でその SKU を削除（ベクトル + メタデータ + 写真ファイルをまとめて削除）。
 
-> 浏览器摄像头只在「安全上下文」可用：`http://127.0.0.1:7860` 直接可用；
-> 局域网 IP 访问需要 HTTPS 或 `gradio launch(share=True)`。
+> ブラウザのカメラは「安全なコンテキスト」でのみ使える：`http://127.0.0.1:7860` はそのまま使える；
+> LAN IP でのアクセスには HTTPS または `gradio launch(share=True)` が必要。---
 
----
+## 5. 各機能の背後にあるアーキテクチャ（タブ別解説）
 
-## 5. 每个功能背后的架构（逐 Tab 拆解）
+### 5.1 Tab 1 · Register：商品登録
 
-### 5.1 Tab 1 · Register：商品入库
-
-**调用链**：
+**呼び出しチェーン**：
 
 ```
 gr.Button("Register")
   └─► app.py do_register(files, name, barcode, price, category)
         └─► pipeline.register_product(images, ...)
-              ├─► Embedder.embed(images)          # ① CLIP：N 张图 → (N, 512) L2 归一化向量
-              ├─► Catalog.add_product(...)        # ② SQLite 插一行 + vectors.npz 追加 N 个向量（打同一个 sku_id）+ 落盘
-              └─► _save_reference_crops(...)      # ③ 参考照片存到 data/crops/skuNNNN_<时间戳>_i.jpg（供 Catalog 页展示）
+              ├─► Embedder.embed(images)          # ① CLIP：N 枚の画像 → (N, 512) L2 正規化ベクトル
+              ├─► Catalog.add_product(...)        # ② SQLite に 1 行挿入 + vectors.npz に N 個のベクトルを追加（同じ sku_id を付与）+ ディスクへ保存
+              └─► _save_reference_crops(...)      # ③ 参照写真を data/crops/skuNNNN_<タイムスタンプ>_i.jpg に保存（Catalog ページ表示用）
 ```
 
-**关键点**：
+**ポイント**：
 
-- 一个 SKU 拥有 **N 个向量**（N = 参考照片张数，1–5 张）。多张照片 = 多角度
-  覆盖，检索时「该 SKU 的最优向量」胜出（见 5.2）。
-- 入库**不碰任何模型权重**——这就是检索式方案的卖点：新品上线秒级完成。
-- 注册照片保存为文件只是为了 Catalog 页展示与人工核对，检索本身只认向量。
+- 1 つの SKU は **N 個のベクトル**を持つ（N = 参照写真の枚数、1–5 枚）。複数枚 =
+  多角度のカバレッジで、検索時は「その SKU の最良ベクトル」が勝つ（5.2 参照）。
+- 登録は**モデルの重みに一切触れない**——これが検索ベース方式の売り：新商品の一括登録は秒オーダーで完了。
+- 登録写真をファイルとして保存するのは Catalog ページでの表示と人手による確認のため。検索自体はベクトルしか見ない。
 
-### 5.2 Tab 2 · Recognize：货架识别（核心管线）
+### 5.2 Tab 2 · Recognize：棚認識（コアパイプライン）
 
-**调用链**：
+**呼び出しチェーン**：
 
 ```
 gr.Button("Recognize")
   └─► app.py do_recognize(image, conf, threshold, imgsz)
         └─► pipeline.recognize(shelf_image, ...)
-              ├─► build_detector().detect(image, conf, imgsz)  # ① YOLO → [Box]（单类别，agnostic NMS）
-              │     DETECTOR=auto 时 = 自训模型 + 单品特写兜底（§7.1）
-              └─► pipeline.match_boxes(image, boxes, thr)      # ② 逐框多尺度裁剪 → CLIP 批量编码 → 向量检索
-                        └─► rank_boxes(...)   # 每个框按 MATCH_SCALES 裁多张、按 SKU 取最大分（§7.2）
+              ├─► build_detector().detect(image, conf, imgsz)  # ① YOLO → [Box]（単一クラス、agnostic NMS）
+              │     DETECTOR=auto の場合 = 自学習モデル + 単品クローズアップ用フォールバック（§7.1）
+              └─► pipeline.match_boxes(image, boxes, thr)      # ② ボックスごとにマルチスケールクロップ → CLIP バッチエンコード → ベクトル検索
+                        └─► rank_boxes(...)   # 各ボックスを MATCH_SCALES に従って複数枚クロップし、SKU ごとに最高スコアを採用（§7.2）
                               └─► Catalog.search(embeddings, topk=5)
-                                    即 (n,512) @ (512,N) 一次矩阵乘法 + 按 SKU 取最优
-              └─► draw_recognitions(...) + summary(...)        # ③ 画框 + 统计文本
+                                    すなわち (n,512) @ (512,N) の 1 回の行列積 + SKU ごとに最良を採用
+              └─► draw_recognitions(...) + summary(...)        # ③ 枠描画 + 統計テキスト
 ```
 
-**关键点**：
+**ポイント**：
 
-- **检测与识别彻底解耦**：检测器只管「框」，SKU 是谁完全由向量检索决定。
-  所以换检测器/换 CLIP 模型/增删商品，互相不影响。
-- 一个框 → 多尺度 crop → 每个 crop 一个向量 → 与库内所有向量算余弦，
-  **先按 SKU 聚合取最高分，再跨尺度取最高分**（一个 SKU 有 5 张参考图就有
-  5 个向量，谁高算谁的），top1 分数 ≥ `MATCH_THRESHOLD` 判为命中，否则
+- **検出と認識は完全に分離**：デテクタは「枠」だけを担当し、SKU が何かは完全にベクトル検索が決める。
+  そのためデテクタの差し替え / CLIP モデルの差し替え / 商品の増減は互いに影響しない。
+- 1 ボックス → マルチスケールクロップ → 各クロップが 1 ベクトル → DB 内全ベクトルとコサインを計算し、
+  **まず SKU ごとに集約して最高スコアを取り、次にスケール横断で最高スコアを取る**（1 つの SKU が参照画像
+  5 枚あれば 5 個のベクトルがあり、高い方が勝つ）。top1 スコアが `MATCH_THRESHOLD` 以上でヒット、それ以外は
   `Unknown (score)`。
-- `match_boxes` 从 `recognize` 里拆出来，是为了让 Live 页（5.3）只对
-  **新目标**跑 CLIP——照片页和实时页共用同一套识别逻辑；排序逻辑放在
-  `rank_boxes()`，`debug_detect.py` 也用它，保证调试工具和 app 打的分完全一致。
-- `agnostic_nms=True`：YOLO-World 一个物体可能被 "package"/"box"/"pouch"
-  多个提示词重复命中，按类别分开的 NMS 去不掉，跨类 NMS 才能压成 1 框。
+- `match_boxes` を `recognize` から切り出したのは、Live ページ（5.3）が**新規ターゲットのみ**に
+  CLIP を走らせるため——写真ページとリアルタイムページで同一の認識ロジックを共用する。ランキングロジックは
+  `rank_boxes()` に置き、`debug_detect.py` もこれを使うことで、デバッグツールと app のスコアが完全に一致することを保証する。
+- `agnostic_nms=True`：YOLO-World では 1 つの物体が "package"/"box"/"pouch"
+  といった複数プロンプトに重複ヒットすることがある。クラス単位の NMS では除去できず、クラス横断 NMS なら 1 ボックスに潰せる。
 
-### 5.3 Tab 3 · Live：摄像头实时标注（性能设计的核心）
+### 5.3 Tab 3 · Live：カメラリアルタイム注釈（性能設計のコア）
 
-**为什么不能每帧全量跑？** M1 MPS 实测：YOLO @960 ≈ 45 ms/帧（~22 FPS），
-但 CLIP 一个 crop ≈ 150–300 ms，一帧 30 个框就是 5–9 秒。所以核心策略是：
+**なぜ毎フレーム全量実行できないのか？** M1 MPS 実測：YOLO @960 ≈ 45 ms/フレーム（~22 FPS）だが、
+CLIP のクロップ 1 枚 ≈ 150–300 ms で、1 フレームに 30 個のボックスあれば 5–9 秒になる。そこでコア戦略は：
 
-> **YOLO 每帧都跑（快），CLIP 只跑「到期」的 track（贵）。**
-> 目标身份靠 ByteTrack 维持，标签靠多帧表决锁定、并定期自动复核。
+> **YOLO は毎フレーム実行（速い）、CLIP は「期限切れ」のトラックのみ実行（高コスト）。**
+> ターゲットの同一性は ByteTrack が維持し、ラベルはマルチフレーム投票で確定させ、定期的に自動で再検証する。
 
-**前端**（自研 HTML/JS，`live_web.py`）：
-
-```
-浏览器 getUserMedia 抓摄像头帧（缩到 ≤1280px，JPEG quality 0.7）
-  → 每帧 POST /live/api/frame {uuid, image(data-url), imgsz, conf, threshold}
-     （同一时刻只允许 1 个在途请求，没回来就跳过本轮，防积压；8s 超时中止）
-  → 服务端回 JSON {boxes[{xyxy,label,match}], n_objects, n_matched, n_new, ms, fps}
-  → 浏览器把视频帧 + 框/标签画在 <canvas> 上，独立 66 ms 定时器重绘（~15 FPS）
-```
-
-覆盖框由**浏览器画**而不是服务端回传绘制好的 JPEG——网络负载极小（只有
-坐标和文字），且检测慢一点画面照样流畅。
-
-**后端**（`live.py`）：
+**フロントエンド**（自作 HTML/JS、`live_web.py`）：
 
 ```
-POST /live/api/frame  (asyncio.to_thread 把 50–300ms 的 MPS 计算踢出事件循环)
+ブラウザの getUserMedia でカメラフレームを取得（≤1280px に縮小、JPEG quality 0.7）
+  → 毎フレーム POST /live/api/frame {uuid, image(data-url), imgsz, conf, threshold}
+     （同時刻に 1 件のみリクエストを進行中として許可。戻らなければそのラウンドをスキップして滞留防止。8s タイムアウトで中断）
+  → サーバが JSON {boxes[{xyxy,label,match}], n_objects, n_matched, n_new, ms, fps} を返す
+  → ブラウザが映像フレーム + ボックス/ラベルを <canvas> に描画。独立した 66 ms タイマーで再描画（~15 FPS）
+```
+
+オーバーレイのボックスは**ブラウザが描画**し、サーバが描画済み JPEG を返す方式ではない——ネットワーク負荷が極小
+（座標とテキストのみ）であり、検出が少し遅れても映像は滑らかに保てる。
+
+**バックエンド**（`live.py`）：
+
+```
+POST /live/api/frame  (asyncio.to_thread で 50–300ms の MPS 計算をイベントループ外へ)
   └─► handle_frame(payload, pipeline)
-        ├─► SESSIONS.get(uuid) → LiveRecognizer     # 每浏览器会话一个，uuid 由前端 crypto.randomUUID() 生成
-        │     （空闲 120s 自动回收；_map_lock 保护会话表，model_lock 串行化模型调用——
-        │      MPS 不喜欢并发推理，两把锁绝不嵌套，避免自死锁）
+        ├─► SESSIONS.get(uuid) → LiveRecognizer     # ブラウザセッションごとに 1 個。uuid はフロントの crypto.randomUUID() が生成
+        │     （120s 放置で自動回収。_map_lock がセッションテーブルを保護、model_lock がモデル呼び出しを直列化——
+        │      MPS は並行推論を嫌うため、2 つのロックは絶対にネストせず、自己デッドロックを回避）
         └─► rec.process(image)
-              1) YOLO 检测（每帧，imgsz 默认 960；检测置信度按 ByteTrack
-                 低置信带跑，弱框参与关联但不进最终输出）。DETECTOR=auto 时
-                 自训模型不像密集货架就自动切 YOLO-World 兜底（§7.1），并把
-                 该帧 ByteTrack 的新建 track 阈值降到 YOLO_WORLD_CONF，
-                 否则兜底框分数太低、建不了 track
-              2) 每会话 ByteTrack；Kalman 消抖 + 高/低置信两段关联、跨帧 id 稳定
-                 （SHELF_TRACKER，默认 bytetrack.yaml；=off 退回旧的贪婪 IoU 匹配）
-              3) CLIP + 检索只跑「到期」的track：新 track 立即、未确认 track 每帧、
-                 已确认 track 每 30 帧轮转复核（单帧封顶 4 个，且整帧最多
-                 EMBED_MAX_PER_FRAME=8 个框进 CLIP，防止某帧算力突刺）
-              4) 时序表决：每个 track 保留最近 5 次检索结果，票数+均值分都过关
-                 （CONFIRM_FRAMES=3 / VOTE_MIN=3）才锁定 SKU；每次检索按
-                 MATCH_SCALES 多尺度裁剪取最大分（§7.2）；确认前画
-                 Unknown（扫描中）、不参与抓取；滞回阈值 MATCH_THRESHOLD_KEEP=0.55
-                 让已确认标签不过分敏感，错误检测无法一次改写标签
-              5) 输出当前所有框的识别结果 + changed 标志（没变化就不回传摘要文本）
+              1) YOLO 検出（毎フレーム、imgsz デフォルト 960。検出確信度は ByteTrack の
+                 低確信度帯で実行し、弱い枠は関連付けには参加するが最終出力には出さない）。DETECTOR=auto の場合、
+                 自学習モデルが密集棚に「見えない」時は自動で YOLO-World フォールバックへ切替え（§7.1）、かつ
+                 そのフレームの ByteTrack 新規トラック閾値を YOLO_WORLD_CONF まで下げる。
+                 さもなくばフォールバック枠のスコアが低すぎてトラックが作れない
+              2) セッションごとに ByteTrack。Kalman による安定化 + 高/低確信度の 2 段階関連付けでフレーム横断の id を安定
+                 （SHELF_TRACKER、デフォルト bytetrack.yaml。=off で従来の貪欲 IoU マッチングに回退）
+              3) CLIP + 検索は「期限切れ」のトラックのみ実行：新規トラックは即座に、未確定トラックは毎フレーム、
+                 確定済みトラックは 30 フレームごとにローテーションで再検証（1 フレームあたり最大 4 個、かつ 1 フレーム全体で
+                 EMBED_MAX_PER_FRAME=8 個の枠まで CLIP に入れ、特定フレームでの計算リソースのスパイクを防止）
+              4) 時系列投票：各トラックは直近 5 回の検索結果を保持し、票数と平均スコアの両方がパスした
+                 （CONFIRM_FRAMES=3 / VOTE_MIN=3）時点で SKU を確定。各検索は
+                 MATCH_SCALES に従ってマルチスケールクロップし最高スコアを採用（§7.2）。確定前は
+                 Unknown（スキャン中）を表示し、grasp には参加しない。ヒステリシス閾値 MATCH_THRESHOLD_KEEP=0.55
+                 で確定済みラベルを過敏にしすぎず、誤検出 1 回でラベルを書き換えられないようにする
+              5) 現在の全ボックスの認識結果 + changed フラグを出力（変化がなければサマリーテキストを返さない）
 ```
 
-**效果**：货架静止时帧率 ≈ 纯检测上限（静态帧 ~61 ms/帧 ≈ 16 FPS）；
-镜头移到新品上时，新目标先过 ByteTrack 一帧闸门，之后几帧各做一次 CLIP，
-约 3 帧（~200 ms）内锁定标签——期间画为 Unknown、不可抓取，标签因此不闪。
+**効果**：棚が静止している時、フレームレート ≈ 純検出の上限（静止フレーム ~61 ms/フレーム ≈ 16 FPS）。
+カメラが新品に向くと、新規ターゲットはまず ByteTrack の 1 フレームゲートを通過し、その後数フレームにわたって各 1 回 CLIP を実行、
+約 3 フレーム（~200 ms）でラベルを確定——その間は Unknown 表示で grasp 不可。そのためラベルはちらつかない。
 
-**为什么前端不用 Gradio 自带的 `gr.Image(streaming=True)`？** Gradio 6 的
-录制按钮文案由内部 `stream_state` 驱动，app 层无法复位——点停止后按钮一直
-卡在 "Stop"，服务端会话也不真正结束（源码级诊断确认，详见
-`docs/plans/2026-08-12-realtime-video-annotation-design.md`）。自研前端后
-Start/Stop 状态始终真实；前端还带 **generation 计数**：停止后晚到的在途
-响应会被丢弃，不会把「已停止」状态覆盖回去。
+**フロントエンドが Gradio 標準の `gr.Image(streaming=True)` を使わない理由**：Gradio 6 の
+録画ボタンの表示は内部の `stream_state` が駆動しており、app レイヤではリセット不能——停止をクリックしてもボタンが
+"Stop" のまま固まったまま、サーバ側のセッションも実際には終了しない（ソースレベルの診断で確認。詳細は
+`docs/plans/2026-08-12-realtime-video-annotation-design.md` 参照）。自作フロントにしたことで
+Start/Stop の状態は常に真実を反映する。フロントには **generation カウンタ**もある：停止後に到着した
+進行中のレスポンスは破棄されるため、「停止済み」の状態を上書きされない。
 
-**Re-recognize 按钮**：POST `/live/api/reset` 清空该会话的跟踪器与表决历史，
-下一帧所有目标重新走完确认流程。SKU 被删除/重新注册后其实不必手动按：
-已确认 track 每 30 帧自动复核一次，会自行修正；想立刻刷新再按。
+**Re-recognize ボタン**：POST `/live/api/reset` でそのセッションのトラッカーと投票履歴をクリアし、
+次のフレームで全ターゲットが確認フローを最初からやり直す。SKU が削除/再登録された後に手動で押す必要は
+実際にはない：確定済みトラックは 30 フレームごとに自動で再検証され、自ら修正する。即座に更新したい時に押せばいい。
 
-**响应里的 `id` 字段**：每个框带稳定 `track_id`（会话内自增，track 存活期间不变）。
-货架上多个同款商品时，靠它跨帧区分"哪一个物理目标"——机械臂必须用它，不能靠名字。
+**レスポンスの `id` フィールド**：各ボックスは安定した `track_id` を持つ（セッション内で自動増加、トラック存続中は不変）。
+棚に同じ商品の複数個体がある場合、フレーム横断で「どの物理ターゲットか」を区別するのはこれ——ロボットアームは必ずこれを使わねばならず、名前では区別できない。
 
-#### 机械臂集成：`GET /live/api/grasp`
+#### ロボットアーム統合：`GET /live/api/grasp`
 
-想让机械臂去抓某个名称的商品，服务端提供「抓取就绪」接口，把时机判断逻辑
-封装在跟踪器内部（`LiveRecognizer._update_grasp` 每帧维护每个名称的稳定性窗口）：
+ロボットアームに特定の名称の商品を grasp させたい場合、サーバは「grasp 準備」インターフェースを提供し、タイミング判断ロジックを
+トラッカー内部にカプセル化（`LiveRecognizer._update_grasp` が毎フレーム各名称の安定ウィンドウを維持）：
 
 ```
-GET /live/api/grasp?uuid=<Live 会话 id>&name=<商品名>
+GET /live/api/grasp?uuid=<Live セッション id>&name=<商品名>
 → {ok, ready, reason, track_id, box[x1,y1,x2,y2], point[cx,cy],
    frames_stable, age_ms, img_w, img_h, available_names[]}
 ```
 
-**`ready=true`（= 最佳抓取时刻）的条件**：该名称的**同一个 track** 连续
-`GRASP_WINDOW=5` 帧（~300 ms @16 FPS）出现，且：
+**`ready=true`（= 最良の grasp 瞬間）の条件**：その名称の**同じトラック**が連続
+`GRASP_WINDOW=5` フレーム（~300 ms @16 FPS）出現し、かつ：
 
-- 相邻两帧框 IoU ≥ `GRASP_IOU=0.9`（位置收敛，滤掉 YOLO 框抖动）；
-- 期间没有新目标被确认（新 track 完成表决那一帧才重置所有窗口；
-  单帧误检形成的未确认 track 不再影响抓取）；
-- 会话 1 秒内（`GRASP_MAX_AGE_MS`）处理过帧（防止对着停掉的摄像头抓）。
+- 隣接 2 フレームのボックス IoU ≥ `GRASP_IOU=0.9`（位置が収束、YOLO 枠の揺れを除外）；
+- その間に新規ターゲットが確定していない（新規トラックが投票完了したフレームのみで全ウィンドウをリセット；
+  単一フレームの誤検出でできた未確定トラックは grasp に影響を与えない）；
+- セッションが 1 秒以内（`GRASP_MAX_AGE_MS`）にフレームを処理している（停止したカメラを向いて grasp しないための防止策）。
 
-返回的 `box` 是窗口 5 帧的**平均框**（消抖），`point` 是其中心点。
+返ってくる `box` はウィンドウ 5 フレームの**平均ボックス**（揺れ除去）、`point` はその中心点。
 
-**机械臂控制器推荐流程**：
+**ロボットアームコントローラ推奨フロー**：
 
-1. 在 Live 页开着摄像头（会话 id 读
-   `document.querySelector('[data-role="slv-root"]').dataset.slvSession`）；
-2. 每 100–200 ms 轮询 `grasp?name=X`（用 `available_names` 核对名称是否打错）；
-3. `ready=true` 后，再同步发一帧 `/live/api/frame` 并用其响应的框（最新鲜，
-   滞后 ≤1 帧）触发抓取动作；
-4. 抓取前相机与货架必须固定；`reason` 字段会告诉你当前为什么还没就绪
-   （未稳定 / 场景有变化 / 摄像头没开）。
+1. Live ページでカメラを起動しておく（セッション id は
+   `document.querySelector('[data-role="slv-root"]').dataset.slvSession` から読む）；
+2. 100–200 ms ごとに `grasp?name=X` をポーリング（`available_names` で名称の綴りミスをチェック）；
+3. `ready=true` になったら、さらに `/live/api/frame` に 1 フレーム同期送信し、そのレスポンスの枠を使う（最新、
+   遅延 ≤1 フレーム）として grasp 動作を発火；
+4. grasp 前にカメラと棚は固定されていること。`reason` フィールドがなぜまだ準備できないかを示す
+   （未安定 / シーン変化あり / カメラ未起動）。
 
-> ⚠️ `box`/`point` 是**发送图像像素**里的 2D 坐标。机械臂还需要相机内参 +
-> 手眼标定把它们换算成 3D 位姿（有深度相机时取框内中心点深度更稳）。
+> ⚠️ `box`/`point` は**送信画像のピクセル上**の 2D 座標。ロボットアームはカメラ内パラメータ +
+> 手眼キャリブレーション（hand-eye calibration）でこれらを 3D ポーズに変換する必要がある（深度カメラがある場合、ボックス内の中心点の深度を取る方が安定）。
 
-### 5.4 Tab 4 · Catalog：商品库管理
+### 5.4 Tab 4 · Catalog：商品 DB 管理
 
-**调用链**：
+**呼び出しチェーン**：
 
 ```
-前端 JS (catalog_web.py, gr.HTML 注入)
+フロント JS (catalog_web.py, gr.HTML で注入)
   ├─► GET  /catalog/api/list
-  │     └─► catalog_api.list_catalog → 每个 SKU 一行 + 照片 URL 列表（/catalog/photos/<文件名>）
-  │        （照片目录 data/crops 用 Starlette StaticFiles 挂载为 /catalog/photos）
+  │     └─► catalog_api.list_catalog → SKU ごとに 1 行 + 写真 URL リスト（/catalog/photos/<ファイル名>）
+  │        （写真ディレクトリ data/crops は Starlette StaticFiles で /catalog/photos にマウント）
   └─► POST /catalog/api/delete {sku_id}
         └─► catalog_api.delete_sku → pipeline.delete_product(sku_id)
-              ├─► VectorStore.remove(sku_id)   # 删掉该 SKU 的全部向量
-              ├─► SQLite DELETE products       # 删元数据行
-              └─► 删 data/crops/skuNNNN_*.jpg  # 删参考照片文件
+              ├─► VectorStore.remove(sku_id)   # その SKU の全ベクトルを削除
+              ├─► SQLite DELETE products       # メタデータ行を削除
+              └─► data/crops/skuNNNN_*.jpg を削除  # 参照写真ファイルを削除
 ```
 
-纯 JSON 进出的 handler（`catalog_api.py`）不依赖任何框架，方便单独测试；
-`app.py` 负责把它们包成 FastAPI 路由。
+純 JSON 入出力のハンドラ（`catalog_api.py`）はどのフレームワークにも依存せず、単体テストが容易；
+`app.py` がこれらを FastAPI ルートにラップする役割を負う。
 
-### 5.5 app.py 的两个「不写就会踩的坑」
+### 5.5 app.py の「書かないと必ず踏む 2 つの坑」
 
-1. **路由要用 `_app=` 传入**：`demo.launch()` 内部会重建 Gradio 的 FastAPI
-   app，预先挂在 `demo.app` 上的自定义路由会被丢掉。所以 `build_app()`
-   新建 `gradio.routes.App()`、挂好全部路由，再以 `_app=fastapi_app` 启动。
-2. **重活必须 `asyncio.to_thread`**：YOLO/CLIP 是同步阻塞调用，不挪线程
-   会卡死 Gradio 事件循环（整个 UI 无响应）。
+1. **ルートは `_app=` で渡す**：`demo.launch()` は内部で Gradio の FastAPI
+   app を再構築し、事前に `demo.app` にマウントしたカスタムルートは破棄される。そこで `build_app()`
+   が新たに `gradio.routes.App()` を作り、全ルートをマウントしてから、`_app=fastapi_app` で起動する。
+2. **重い処理は必ず `asyncio.to_thread`**：YOLO/CLIP は同期的ブロッキング呼び出し。スレッドに移さないと
+   Gradio のイベントループを止め、UI 全体が無応答になる。
 
 ---
 
-## 6. 数据流向与持久化
+## 6. データフローと永続化
 
-注册和识别共用同一个向量空间（同一个 CLIP 模型编码），这是整条链路成立的根本：
+登録と認識は同一のベクトル空間を共有（同一の CLIP モデルでエンコード）——これが全チェーンが成立する根本条件：
 
 ```
-          注册（一次性）                          识别（每次查询）
-  ┌────────────────────┐              ┌──────────────────────────┐
-  │ 参考照片 ×N         │              │ 货架照片                   │
-  │      ▼              │              │ YOLO → Box ×N → crops ×N │
-  │ CLIP.encode_image   │              │      ▼                   │
-  │      ▼              │              │ CLIP.encode_image（同一模型）│
-  │ (N, 512) 归一化向量  │   同一个      │      ▼                   │
-  └──────┬─────────────┘   向量空间 ──► │ 余弦相似度 vs 库内全部向量  │
-         │                             └────────────┬─────────────┘
-         ▼                                          ▼
-   ┌─────────────────────────── data/ 目录 ──────────────────────┐
-   │ vectors.npz     {vectors: (N,512) float32, ids: (N,) int64} │
-   │                   ↑ N 是参考照片总数（不是 SKU 数），ids 记录每个向量属于哪个 sku_id │
-   │ catalog.sqlite  products(sku_id, name, barcode, price,      │
-   │                   category, n_refs, created_at)             │
-   │ crops/          sku0007_20260811113440_0.jpg …（展示用照片）  │
-   └─────────────────────────────────────────────────────────────┘
+  登録（一回限り）                                  認識（クエリ毎）
+  ┌────────────────────────┐                        ┌──────────────────────────────────┐
+  │ 参考写真 ×N            │                        │ 棚の写真                         │
+  │ ▼                      │                        │ YOLO → Box ×N → crops ×N         │
+  │ CLIP.encode_image      │                        │ ▼                                │
+  │ ▼                      │                        │ CLIP.encode_image（同一モデル）  │  同じ
+  │ (N, 512) 正規化ベクトル│                        │ ▼                                │  コサイン類似度 vs DB 内全ベクトル
+  └───────────┬────────────┘ 同一ベクトル空間 ─────►│                                  │
+              ▼                                     └────────────────┬─────────────────┘
+                                                                     ▼
+   ┌────────────────────────────────────────────────data/ ディレクトリ──────────────────────────────────────────────────┐
+   │ vectors.npz     {vectors: (N,512) float32, ids: (N,) int64}                                                        │
+   │                 ↑ N は参考写真の総数（SKU 数ではない）。ids は各ベクトルの所属 sku_id を記録                       │
+   │ catalog.sqlite  products(sku_id, name, barcode, price,                                                             │
+   │                 category, n_refs, created_at)                                                                      │
+   │ crops/          sku0007_20260811113440_0.jpg …（表示用の写真）                                                     │
+   └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- 每次 add/delete 后 `vectors.npz` 整表重写（几千个向量的规模，毫秒级）。
-- 换 CLIP 模型 = 换了向量空间 → 旧向量全部失效，**需要重新注册所有商品**
-  （`VectorStore._load` 以文件里存的维度为准，防止维度不一致时静默错配）。
+- 各 add/delete の後、`vectors.npz` は全量書き換え（数千ベクトルの規模ならミリ秒オーダー）。
+- CLIP モデルの差し替え = ベクトル空間が変わる → 旧ベクトルは全滅し、**全商品の再登録が必要**
+  （`VectorStore._load` はファイルに保存された次元を正とし、次元不一致時のサイレントな誤マッチを防止）。
 
 ---
 
-## 7. 检测器选型（直接决定「能不能检测到商品」）
+## 7. デテクタの選択（「商品が検出できるか」を直接決定する）
 
-用 `DETECTOR` 环境变量切换后端（`shelf_demo/detector.py` 内部分发）：
+`DETECTOR` 環境変数でバックエンドを切替（`shelf_demo/detector.py` 内でディスパッチ）：
 
-| `DETECTOR` | 模型 | 原理 | 框质量 | 何时用 |
+| `DETECTOR` | モデル | 原理 | ボックス品質 | いつ使うか |
 |-----------|------|------|--------|--------|
-| `auto`（**默认**，需 custom 权重存在） | SKU-110K 自训 YOLO **+** YOLO-World 兜底 | 先跑自训模型判「像不像密集货架」，不像时再跑零样本模型 | 密集货架=★ 又多又紧；单品特写=★ 一个准框 | **推荐**。货架和「手持单品对着摄像头」都要能用 |
-| `custom` | 本项目在 SKU-110K 训练的 YOLOv8n（单类别 "product"） | 有监督微调 | 密集货架 ★，**单品特写 ✗** | 只拍密集货架、追求最快 |
-| `world`（无 custom 权重时的默认） | YOLO-World (`yolov8s-worldv2.pt`) | 开放词表，文字提示词驱动，**零训练** | 单品特写 ★，密集货架偏松 | 没有训练权重时；或只认手持单品 |
-| `coco` | 普通 YOLOv8n (`yolov8n.pt`) | COCO 80 类预训练 | 对零食/包装**几乎检不到** | 只是先把 UI 跑起来 |
+| `auto`（**デフォルト**、custom ウェイトの存在が必要） | SKU-110K 自学習 YOLO **+** YOLO-World フォールバック | まず自学習モデルで「密集棚に見えるか」を判定し、見えない時にゼロショットモデルを実行 | 密集棚=★ 多くてぴったり；単品クローズアップ=★ 1 個の正確な枠 | **推奨**。棚と「手持ちの単品をカメラに向けた」両方で動きたい場合 |
+| `custom` | 本プロジェクトが SKU-110K で学習した YOLOv8n（単一クラス "product"） | 教師ありファインチューニング | 密集棚 ★、**単品クローズアップ ✗** | 密集棚のみ撮影で最速を重視する場合 |
+| `world`（custom ウェイトが無い時のデフォルト） | YOLO-World (`yolov8s-worldv2.pt`) | オープンボキャブラリ、テキストプロンプト駆動、**ゼロ学習** | 単品クローズアップ ★、密集棚はやや緩め | 学習ウェイトが無い時；または手持ちの単品のみ認識する場合 |
+| `coco` | 通常 YOLOv8n (`yolov8n.pt`) | COCO 80 クラス事前学習 | スナック/パッケージには**ほぼ検出不能** | まず UI を動かすだけの場合 |
 
-**默认逻辑**（`config.py`）：`weights/sku110k_best.pt` 存在 → 自动 `auto`；
-否则回退 `world`。
+**デフォルトロジック**（`config.py`）：`weights/sku110k_best.pt` が存在 → 自動で `auto`；
+無ければ `world` にフォールバック。
 
-### 7.1 为什么需要 `auto`：两个后端在相反的场景各失效
+### 7.1 なぜ `auto` が必要か：2 つのバックエンドは真逆のシーンでそれぞれ失効する
 
-SKU-110K 自训模型的训练先验是「**一格里密密麻麻全是小商品**」。把**单个**商品
-举到 OBSBOT 摄像头前时它完全out-of-distribution：
+SKU-110K 自学習モデルの学習事前知識は「**1 セルにびっしりと小さな商品が詰まっている**」。
+**単一の**商品を OBSBOT カメラの前に突き出すと完全に out-of-distribution：
 
-| 场景 | `custom` 检到 | YOLO-World 检到 |
+| シーン | `custom` 検出 | YOLO-World 検出 |
 |------|--------------|----------------|
-| 4K 密集货架 `data/shelf.jpg` | **77** 个紧框，覆盖画面 35% | 9 个松散大框（常把整排框一起） |
-| 单品特写（`data/crops/` 17 张参考图） | **0/17 有可用框**：要么 0 框，要么幻觉出几十~几百个 10px 小框（最大框仅占画面 0.4%） | **15/17** 一个高置信大框 |
+| 4K 密集棚 `data/shelf.jpg` | **77** 個のぴったり枠、映像面積の 35% をカバー | 9 個の緩い大枠（1 列まるごと枠に入れることも） |
+| 単品クローズアップ（`data/crops/` の参照画像 17 枚） | **0/17 に有用な枠なし**：枠 0 個、または 10px の小枠を数十~数百個ハルシネーション（最大の枠も映像の 0.4% 以下） | **15/17** で高確信度の 1 個の大枠 |
 
-所以「明明登录了 SKU，举到摄像头前却没有 bounding box」不是阈值问题——**降
-`conf` 只会让自训模型吐出一堆小框**，真正的框它根本没学出来。`auto` 的做法是
-**按输出形态切换**（`AutoDetector`，阈值都在 `config.py`）：
+つまり「SKU は登録済みなのに、カメラの前に持っても bounding box が現れない」のは閾値の問題ではない——**`conf` を
+下げても自学習モデルは大量の小枠を吐くだけ**で、本物の枠はそもそも学習できていない。`auto` のやり方は
+**出力形状で切替える**（`AutoDetector`、閾値は全て `config.py` にある）：
 
 ```
-coverage = 自训模型所有框的并集 / 画面面积
-max_area = 最大框 / 画面面积
-trusted  = 有框 and coverage >= AUTO_COVERAGE_MIN(0.15) and max_area >= AUTO_MIN_AREA(0.01)
+coverage = 自学習モデルの全ボックスの和集合 / 映像面積
+max_area = 最大のボックス / 映像面積
+trusted  = 枠が存在 and coverage >= AUTO_COVERAGE_MIN(0.15) and max_area >= AUTO_MIN_AREA(0.01)
 
-trusted  → 用自训模型的框（密集货架，与改动前逐字节一致）
-不 trusted → 跑 YOLO-World；只有它找到「大物件」(max_area >= AUTO_SWITCH_AREA=0.05)
-            才采信它，否则保留自训模型的结果
+trusted  → 自学習モデルの枠を使う（密集棚、変更前とバイト単位で一致）
+trusted でない → YOLO-World を実行；「大きな物体」(max_area >= AUTO_SWITCH_AREA=0.05) を見つけた
+            場合のみ採用、そうでなければ自学習モデルの結果を維持
 ```
 
-阈值是量出来的、不是拍的：密集货架 coverage 0.20–0.44、最大框 2.0–3.5%；
-17 张单品特写 coverage ≤0.16、最大框 <1%（多数 <0.4%），两边余量很大。
-在 `auto` 下密集货架一帧都不会触发兜底（`path=specialist`），单品特写才会
+閾値は実測に基づき、思いつきで決めたものではない：密集棚の coverage は 0.20–0.44、最大ボックス 2.0–3.5%；
+単品クローズアップ 17 枚は coverage ≤0.16、最大ボックス <1%（大半 <0.4%）で、両端に十分な余裕がある。
+`auto` では密集棚は 1 フレームたりともフォールバックをトリガーしない（`path=specialist`）、単品クローズアップのみがトリガーする
 （`path=fallback`）。
 
-**可复现实证**：
+**再現可能な証拠**：
 
 ```bash
-python scripts/verify_detection.py     # 17 张特写：custom 0/17 → auto 15/17 有可用框；
-                                       # 密集货架：auto 与 custom 逐字节一致（35 框）
-python scripts/test_live_closeup.py    # 真链路（含 CLIP 检索）：
-                                       # ALKALINE 参考图 → 1 个框 + 标签 ALKALINE(0.68)
+python scripts/verify_detection.py     # クローズアップ 17 枚：custom 0/17 → auto 15/17 に有用な枠；
+                                       # 密集棚：auto は custom とバイト単位で一致（35 ボックス）
+python scripts/test_live_closeup.py    # 本物のチェーン（CLIP 検索含む）：
+                                       # ALKALINE 参照画像 → 1 ボックス + ラベル ALKALINE(0.68)
 ```
 
-**代价**：兜底帧多跑一次 YOLO-World（@960 约 185 ms，@640 约 90 ms）。密集货架
-不触发，所以常态帧率不受影响；`app.py` 启动时预热兜底模型，避免第一帧卡住。
+**コスト**：フォールバックフレームで YOLO-World を 1 回余分に実行（@960 で約 185 ms、@640 で約 90 ms）。密集棚では
+トリガーされないため、通常のフレームレートには影響しない。`app.py` は起動時にフォールバックモデルをウォームアップし、初回フレームの固まりを回避する。
 
-#### 怎么判断「这一帧」用的是自训模型还是 YOLO-World？
+#### 「このフレーム」が自学習モデルか YOLO-World かを見分ける方法
 
-`auto` 是**逐帧**决定的，所以下面几种方式看到的都是「最近一帧」的结果。
-内部状态是 `detector.last_path`（`specialist` = 自训模型 / `fallback` = YOLO-World），
-对外统一暴露为 `detector.active_backend`（`custom` / `world`）：
+`auto` は**フレーム単位**で決まるため、次のどの方法で見ても「直近 1 フレーム」の結果になる。
+内部状態は `detector.last_path`（`specialist` = 自学習モデル / `fallback` = YOLO-World）、
+対外は統一して `detector.active_backend`（`custom` / `world`）として公開：
 
-| 方式 | 看哪里 | 说明 |
+| 方法 | 見る場所 | 説明 |
 |------|--------|------|
-| **Live 页（最直观）** | 状态栏末尾 `· model SKU-110K` 或 `· model YOLO-World` | 每帧刷新；举着单品时显示 YOLO-World，对着货架时显示 SKU-110K |
-| **启动横幅** | `python app.py` 打印的 `检测器 Detector : auto — ...` | 只说明启用了 auto 模式，不表示某一帧用了谁 |
-| **调试脚本** | `debug_detect.py` 的 `[STAGE 1] DETECTION: N boxes ... (path: fallback)` | 单张图，最详细 |
-| **批量对比** | `verify_detection.py` 输出的 `path=` 列 | 与 `custom`/`world` 单独跑的结果并排看 |
-| **代码里** | `pipeline.detector.active_backend` | 机械臂 / 外部程序集成时用这个 |
-| **强制固定** | `DETECTOR=custom` 或 `DETECTOR=world` | 想排除 auto 影响、复现某一后端时用 |
+| **Live ページ（最も直感的）** | ステータスバー末尾の `· model SKU-110K` または `· model YOLO-World` | 毎フレーム更新；単品を持っている時は YOLO-World、棚を向いている時は SKU-110K と表示 |
+| **起動バナー** | `python app.py` が出力する `検出器 Detector : auto — ...` | auto モードが有効であることを示すだけで、某フレームで誰が使われたかは示さない |
+| **デバッグスクリプト** | `debug_detect.py` の `[STAGE 1] DETECTION: N boxes ... (path: fallback)` | 単一画像、最も詳細 |
+| **バッチ比較** | `verify_detection.py` 出力の `path=` 列 | `custom`/`world` の単独実行結果と並べて見る |
+| **コード内** | `pipeline.detector.active_backend` | ロボットアーム / 外部プログラムの統合はこちらを使う |
+| **強制固定** | `DETECTOR=custom` または `DETECTOR=world` | auto の影響を排除して某バックエンドを再現したい時 |
 
 ```bash
-# 最省事的判断：把商品举到摄像头前，看 Live 状态栏
-#   显示 model YOLO-World  -> 说明自训模型没认出场景，走了兜底（正常）
-#   显示 model SKU-110K    -> 说明自训模型认为这是密集货架
+# 最も手軽な判断：商品をカメラの前に突き出し、Live のステータスバーを見る
+#   model YOLO-World と表示  -> 自学習モデルがシーンを認識できずフォールバックに入った（正常）
+#   model SKU-110K と表示    -> 自学習モデルがこれを密集棚と判断
 python app.py
 
-# 单张图命令行验证
+# 単一画像の CLI 検証
 python scripts/debug_detect.py data/crops/sku0026_20260901002504_0.jpg --imgsz 960
 #   -> [STAGE 1] DETECTION: 1 boxes ... (path: fallback)
 python scripts/debug_detect.py data/shelf.jpg --imgsz 960
 #   -> [STAGE 1] DETECTION: 35 boxes ... (path: specialist)
 ```
 
-**已验证的对比**（`python scripts/compare_detectors.py data/shelf.jpg`，
-输出 `data/compare_custom.jpg` / `data/compare_world.jpg`）：同一张 4K 货架图，
-custom 检出 **61** 个紧贴单品边框（中位 200×148 px），YOLO-World 只有 **21**
-个松散大框（中位 412×333 px，经常框住整排商品）。
+**検証済みの比較**（`python scripts/compare_detectors.py data/shelf.jpg`、
+出力は `data/compare_custom.jpg` / `data/compare_world.jpg`）：同じ 4K 棚画像で、
+custom は単品にぴったりの **61** 個のボックスを検出（中央値 200×148 px）、YOLO-World は **21**
+個の緩い大枠のみ（中央値 412×333 px、頻繁に 1 列まるごと枠に入れる）。
 
-YOLO-World 提示词可用 `YOLO_WORLD_PROMPTS` 自定义（逗号分隔），默认已扩到
-20 个零售/包装词（`...,battery,jar,tube,cylinder,container,cup,cup noodle,tin,object`）：
-多这几个词把兜底命中率从 13/17 提到 16/17。兜底模型用自己的置信度
-`YOLO_WORLD_CONF=0.05` 和 NMS `YOLO_WORLD_IOU=0.5`（与自训模型的 0.2/0.3 解耦）。
+YOLO-World のプロンプトは `YOLO_WORLD_PROMPTS` でカスタマイズ可能（カンマ区切り）。デフォルトでは
+小売/パッケージ語 20 個まで拡張済み（`...,battery,jar,tube,cylinder,container,cup,cup noodle,tin,object`）：
+この数語の追加でフォールバックのヒット率が 13/17 から 16/17 に向上。フォールバックモデルは独自の確信度
+`YOLO_WORLD_CONF=0.05` と NMS `YOLO_WORLD_IOU=0.5` を使う（自学習モデルの 0.2/0.3 と分離）。
 
-**为什么默认参数随检测器变化**（这是"检测不到商品"的第一大坑）：
+**デフォルトパラメータがデテクタごとに変わる理由**（「商品が検出されない」の第 1 の坑）：
 
-| 参数 | `custom` | `world`/`coco` | 原因 |
+| パラメータ | `custom` | `world`/`coco` | 理由 |
 |------|----------|----------------|------|
-| `DETECT_CONF` | 0.2 | 0.05 | 训练过的模型置信度校准良好；YOLO-World 零样本分数普遍偏低，阈值高了直接 0 框 |
-| `DETECT_IOU` | 0.3 | 0.5 | 单类训练模型会在同一商品上叠出偏移半格的重复框（IoU≈0.4），0.5 去不掉，0.3 可以，且不会误并真正相邻的商品 |
-| `DETECT_IMGSZ` | 1280 | 1280 | 4K 货架照片压到 640 后商品太小；密集货架建议 1920 |
+| `DETECT_CONF` | 0.2 | 0.05 | 学習済みモデルは確信度のキャリブレーションが良い；YOLO-World のゼロショットスコアは全体的に低く、閾値が高ければ即座に 0 枠 |
+| `DETECT_IOU` | 0.3 | 0.5 | 単一クラス学習モデルは同じ商品に半セルずれた重複枠を重ねる（IoU≈0.4）。0.5 では除去できず、0.3 で除去でき、本当に隣接している商品を誤って合併することもない |
+| `DETECT_IMGSZ` | 1280 | 1280 | 4K 棚写真を 640 に圧縮すると商品が小さすぎる；密集棚は 1920 推奨 |
 
-**已验证的对比**（`python scripts/compare_detectors.py data/shelf.jpg`，
-输出 `data/compare_custom.jpg` / `data/compare_world.jpg`）：同一张 4K 货架图，
-custom 检出 **61** 个紧贴单品边框（中位 200×148 px），YOLO-World 只有 **21**
-个松散大框（中位 412×333 px，经常框住整排商品）。
+**検証済みの比較**（`python scripts/compare_detectors.py data/shelf.jpg`、
+出力は `data/compare_custom.jpg` / `data/compare_world.jpg`）：同じ 4K 棚画像で、
+custom は単品にぴったりの **61** 個のボックスを検出（中央値 200×148 px）、YOLO-World は **21**
+個の緩い大枠のみ（中央値 412×333 px、頻繁に 1 列まるごと枠に入れる）。
 
-YOLO-World 提示词可用 `YOLO_WORLD_PROMPTS` 自定义（逗号分隔），默认已扩到
-20 个零售/包装词（`...,battery,jar,tube,cylinder,container,cup,cup noodle,tin,object`）：
-多这几个词把兜底命中率从 13/17 提到 16/17。兜底模型用自己的置信度
-`YOLO_WORLD_CONF=0.05` 和 NMS `YOLO_WORLD_IOU=0.5`（与自训模型的 0.2/0.3 解耦）。
+YOLO-World のプロンプトは `YOLO_WORLD_PROMPTS` でカスタマイズ可能（カンマ区切り）。デフォルトでは
+小売/パッケージ語 20 個まで拡張済み（`...,battery,jar,tube,cylinder,container,cup,cup noodle,tin,object`）：
+この数語の追加でフォールバックのヒット率が 13/17 から 16/17 に向上。フォールバックモデルは独自の確信度
+`YOLO_WORLD_CONF=0.05` と NMS `YOLO_WORLD_IOU=0.5` を使う（自学習モデルの 0.2/0.3 と分離）。
 
-### 7.2 配套修复：检索端多尺度裁剪（框出来了，还要认得对）
+### 7.2 付随修正：検索側のマルチスケールクロップ（枠は出た、あとは正しく認識できなければ）
 
-只修检测还不够：框出来后如果标签是红色 `Unknown`，体验一样是坏的。实测
-ALKALINE 参考图——检测修好后有 1 个框，但检索分数只有 **0.592**（阈值 0.65）。
-根因不在排序（top-1 就是 ALKALINE，第二名才 0.360），而在**尺度不匹配**：
+検出の修正だけでは不十分：枠が出てもラベルが赤の `Unknown` なら、体感は同じく壊れている。
+ALKALINE 参照画像の実測——検出を直して 1 個の枠が出たが、検索スコアは **0.592** しか無い（閾値 0.65）。
+根本原因はランキングにはない（top-1 は ALKALINE、2 位が 0.360）で、**スケール不一致**：
 
 ```
-商品库里存的是「注册时的整张照片」；
-查询时喂给 CLIP 的是「检测框的紧裁剪」。
-紧裁剪丢掉了参考照片里的背景/比例上下文 → 同一个商品的余弦被压低。
+商品DB に保存されているのは「登録時の写真まるごと」；
+クエリ時に CLIP に渡しているのは「検出枠のぴったりクロップ」。
+ぴったりクロップは参照写真の背景/比率の文脈を失う → 同一商品のコサインが押し下げられる。
 ```
 
-`rank_boxes()`（`shelf_demo/pipeline.py`）现在对每个框按 `MATCH_SCALES`
-（默认 `1.0,1.2`）各裁一张、各编码一次，**按 SKU 取最大分**（test-time
-augmentation，只会抬高真命中的分）：
+`rank_boxes()`（`shelf_demo/pipeline.py`）は現在、各ボックスを `MATCH_SCALES`
+（デフォルト `1.0,1.2`）で各 1 枚クロップし各 1 回エンコードして、**SKU ごとに最高スコアを採用**（test-time
+augmentation で、真のヒットのスコアは上がる一方）：
 
-| 指标（17 张参考图，`scripts/eval_match.py`） | 紧裁剪 1.0 | +1.2 | 多尺度取最大 |
+| 指標（参照画像 17 枚、`scripts/eval_match.py`） | ぴったりクロップ 1.0 | +1.2 | マルチスケール最高値 |
 |---|---|---|---|
-| 真命中平均余弦 | 0.751 | 0.801 | **0.824** |
-| 真命中中位余弦 | 0.797 | 0.876 | **0.876** |
-| 过 `MATCH_THRESHOLD=0.65` 的张数 | ~9/17 | 15/17 | **15/17** |
+| 真のヒットのコサイン平均 | 0.751 | 0.801 | **0.824** |
+| 真のヒットのコサイン中央値 | 0.797 | 0.876 | **0.876** |
+| `MATCH_THRESHOLD=0.65` を超えた枚数 | ~9/17 | 15/17 | **15/17** |
 
-ALKALINE 由 0.587 → **0.671**（过阈值，标签变绿）。代价是多一次 CLIP 编码；
-想省算力可设 `MATCH_SCALES=1.0` 关掉。
+ALKALINE は 0.587 → **0.671**（閾値通過、ラベルが緑に）。コストは CLIP エンコード 1 回分；
+計算リソースを節約したい場合は `MATCH_SCALES=1.0` で無効化可能。
 
-> 更彻底的解法是**注册时也用物体裁剪**（让库里存的就是单品裁剪，和查询同分布），
-> 但那需要重新注册已有 SKU，所以这里先用不改数据的多尺度查询达到同样的对齐效果。
+> より徹底的な解決策は**登録時も物体クロップを使う**こと（DB に単品クロップを保存し、クエリと同一分布にする）だが、
+> 既存 SKU の再登録が必要になるため、ここではデータを改めないマルチスケールクエリで同じアライメント効果を先に実現する。
 
 ---
+## 8. 自分でデテクタを学習する：SKU-110K 完全ガイド
 
-## 8. 如何训练自己的检测器：SKU-110K 完整指南
+> 目標：**単一クラスで、密集棚にボックスが多くてぴったり**の商品デテクタを得て、
+> ボックスが緩めのゼロショット YOLO-World を置き換える。
 
-> 目标：得到一个**单类别、密集货架上框又多又紧**的商品检测器，
-> 替代框偏松的零样本 YOLO-World。
+### 8.1 なぜ SKU-110K データセットか？
 
-### 8.1 为什么是 SKU-110K 数据集？
+- **SKU-110K** は小売棚向けの密集物体検出データセット：棚画像約 1.17 万枚
+  （このリポジトリの `datasets/SKU-110K/`：train 8219 / val 588 / test 2936）、
+  **11 万+ のアノテーションボックス**、画像は 3024×3024。
+- クラスは `object`（= 商品）のみ——**まさに我々が望んでいる形**：デテクタは
+  「どこに商品があるか」だけを学習し、商品が何かは下流の検索パイプラインに委ねる。
+- アノテーションは CSV（`image_name,x1,y1,x2,y2,class,image_width,image_height`）、
+  Ultralytics は `data="SKU-110K.yaml"` で参照する。
 
-- **SKU-110K** 是零售货架密集目标检测数据集：约 1.17 万张货架图
-  （本仓库 `datasets/SKU-110K/`：train 8219 / val 588 / test 2936），
-  **11 万+ 个标注框**，图像 3024×3024。
-- 它只有一个类别 `object`（= 商品），**恰好就是我们要的**：检测器只学
-  「哪里有商品」，商品是谁交给后面的检索管线。
-- 标注是 CSV（`image_name,x1,y1,x2,y2,class,image_width,image_height`），
-  Ultralytics 用 `data="SKU-110K.yaml"` 引用它。
-
-### 8.2 训练命令
+### 8.2 学習コマンド
 
 ```bash
-# 完整质量训练（推荐在 CUDA 机器上；M 系列 Mac 用 mps 也可以，慢一些）
+# 完全品質の学習（CUDA マシン推奨；M シリーズ Mac も mps で可、やや遅い）
 python scripts/train_sku110k.py --model yolov8n.pt --epochs 50
 
-# 快速 demo 级训练（本仓库现有权重就是这样练的：15% 数据子集，~1.2 小时 @ M1 MPS）
+# 高速 demo 級学習（このリポジトリの既存ウェイトはこれで学習：データ 15% サブセット、~1.2 時間 @ M1 MPS）
 python scripts/train_sku110k.py --model yolov8n.pt --epochs 15 --fraction 0.15 --batch 8
 ```
 
-脚本参数（`scripts/train_sku110k.py`）：
+スクリプトのパラメータ（`scripts/train_sku110k.py`）：
 
-| 参数 | 默认 | 说明 |
+| パラメータ | デフォルト | 説明 |
 |------|------|------|
-| `--model` | `yolov8n.pt` | 基础权重（n 最快，s/m 精度更高）。首次会自动下载 |
-| `--epochs` | 15 | 训练轮数。全量数据建议 50+ |
-| `--imgsz` | 640 | 训练分辨率（推理时再用 `DETECT_IMGSZ=1280/1920`） |
-| `--batch` | 16 | 显存/MPS 内存不足就调小（M1 实测 8 稳妥） |
-| `--fraction` | 1.0 | 每轮只用训练集的比例；0.15 = 快速验证 |
+| `--model` | `yolov8n.pt` | ベースウェイト（n が最速、s/m は精度高い）。初回は自動ダウンロード |
+| `--epochs` | 15 | 学習ラウンド数。全データなら 50+ 推奨 |
+| `--imgsz` | 640 | 学習解像度（推論時は `DETECT_IMGSZ=1280/1920` を使う） |
+| `--batch` | 16 | GPU メモリ/MPS メモリが足りなければ下げる（M1 実測 8 が安定） |
+| `--fraction` | 1.0 | 各ラウンドで使う訓練セットの割合；0.15 = 高速検証 |
 | `--device` | auto | `cuda` / `mps` / `cpu` |
-| `--patience` | 10 | 早停：10 轮没有提升就停 |
+| `--patience` | 10 | 早期停止：10 ラウンド改善しなければ停止 |
 
-**首次运行** Ultralytics 会自动下载 SKU-110K 数据集（**约 13 GB**）到
-`datasets/`，请耐心等待；之后重复训练直接用本地缓存。
+**初回実行**時に Ultralytics が SKU-110K データセット（**約 13 GB**）を
+`datasets/` に自動ダウンロードする——時間がかかるので辛抱強く待って；以降の再学習はローカルキャッシュをそのまま使う。
 
-### 8.3 训练过程中会发生什么
+### 8.3 学習中に何が起こるか
 
-所有产物在 `runs/detect/sku110k/`：
+成果物は全て `runs/detect/sku110k/` に入る：
 
 ```
 runs/detect/sku110k/
-├── results.csv        # 每轮指标（loss、P、R、mAP50、mAP50-95）
-├── results.png        # loss/精度曲线
-├── BoxPR_curve.png    # 精度-召回曲线
+├── results.csv        # ラウンドごとの指標（loss、P、R、mAP50、mAP50-95）
+├── results.png        # loss/精度カーブ
+├── BoxPR_curve.png    # 精度-適合率カーブ
 ├── confusion_matrix*.png
-├── train_batch0.jpg   # 训练采样可视化（看数据增广效果）
-├── val_batch0_pred.jpg# 验证集预测可视化（肉眼看框质量）
+├── train_batch0.jpg   # 学習サンプレの可視化（データ拡張の効果を見る）
+├── val_batch0_pred.jpg# 検証セット予測の可視化（目視でボックス品質を確認）
 └── weights/
-    ├── best.pt        # ★ 验证集上最好的权重（要用的就是它）
-    └── last.pt        # 最后一轮权重
+    ├── best.pt        # ★ 検証セットで最良のウェイト（使うのはこれ）
+    └── last.pt        # 最終ラウンドのウェイト
 ```
 
-**怎么读指标**（新人版）：
+**指標の見方**（初心者向け）：
 
-- **P（precision 精确率）**：检测出的框里有多少是对的。0.85 = 检 100 个框，85 个准。
-- **R（recall 召回率）**：真实商品里有多少被检到。0.76 = 漏了 24%。
-- **mAP@50**：IoU 阈值 0.5 下的平均精度，密集检测的"总分"。>0.8 说明框又多又基本压得住商品。
-- **mAP@50-95**：IoU 0.5~0.9 全档位的平均，更苛刻地衡量**框的紧致度**。
-  本仓库现有权重是 0.473——还能提升（见 8.5）。
+- **P（precision 精度）**：検出した枠のうち何割が正しいか。0.85 = 100 個検出して 85 個正しい。
+- **R（recall 適合率）**：実際の商品の中で何割が検出されたか。0.76 = 24% を見落としている。
+- **mAP@50**：IoU 閾値 0.5 での平均精度。密集検出の「総合点」。>0.8 ならボックスが多くて商品に概ねぴったり。
+- **mAP@50-95**：IoU 0.5~0.9 の全レンジの平均で、**ボックスのぴったり度**をより厳しく測る。
+  このリポジトリの既存ウェイトは 0.473——まだ改善の余地（8.5 参照）。
 
-### 8.4 本仓库已完成的一次训练（可复现）
+### 8.4 このリポジトリで既に完了した 1 回の学習（再現可能）
 
-| 项 | 值 |
+| 項目 | 値 |
 |----|----|
-| 基础模型 | yolov8n.pt（预训练初始化） |
-| 数据 | SKU-110K，`fraction=0.15`（每轮用 15% 训练集） |
-| 超参 | 15 epochs, imgsz 640, batch 8, patience 10 |
-| 硬件 | M1 MPS，约 1.2 小时 |
-| 结果 | **P = 0.852 / R = 0.761 / mAP@50 = 0.818 / mAP@50-95 = 0.473** |
-| 权重 | 已复制到 `weights/sku110k_best.pt`，app 自动启用 |
+| ベースモデル | yolov8n.pt（事前学習初期化） |
+| データ | SKU-110K、`fraction=0.15`（各ラウンドで訓練セットの 15%） |
+| 超パラメータ | 15 epochs, imgsz 640, batch 8, patience 10 |
+| ハードウェア | M1 MPS、約 1.2 時間 |
+| 結果 | **P = 0.852 / R = 0.761 / mAP@50 = 0.818 / mAP@50-95 = 0.473** |
+| ウェイト | `weights/sku110k_best.pt` にコピー済み、app が自動有効化 |
 
-### 8.5 训练完怎么部署 + 怎么提质
+### 8.5 学習後のデプロイ + 品質向上のしかた
 
 ```bash
-# 1) 把最优权重放到标准位置（app 检测到它会自动启用 auto 后端）
+# 1) 最良のウェイトを標準位置へ（app がこれを見つけると auto バックエンドを自動有効化）
 cp runs/detect/sku110k/weights/best.pt weights/sku110k_best.pt
 
-# 2) 启动并肉眼验证
+# 2) 起動して目視で検証
 python app.py
 
-# 3) 量化验证：和 YOLO-World / auto 对比框质量
+# 3) 定量的検証：YOLO-World / auto とボックス品質を比較
 python scripts/compare_detectors.py data/shelf.jpg
 python scripts/verify_detection.py
-# 期望：custom 框数更多、中位框尺寸更小（更贴单品）；
-#       单品特写则由 auto 的兜底路径给出可用框
+# 期待値：custom はボックス数が多く、ボックス中央値サイズが小さい（単品にぴったり）；
+#         単品クローズアップは auto のフォールバック経路で有用な枠が出る
 ```
 
-如果不想自动启用，也可以显式指定：
+自動有効化したくない場合は明示的に指定もできる：
 
 ```bash
 export DETECTOR=custom
@@ -611,220 +609,220 @@ export YOLO_WEIGHTS=runs/detect/sku110k/weights/best.pt
 python app.py
 ```
 
-**想再提质，按性价比排序**：
+**さらなる品質向上なら、費用対効果の順に**：
 
-1. **全量数据 + 更多轮**：`--fraction 1.0 --epochs 50`（最直接的收益，R 和 mAP 都会上来）；
-2. **换更大的模型**：`--model yolov8s.pt`（甚至 m），换框紧致度（mAP@50-95）；
-3. **换 CUDA 机器**：M1 MPS 上 batch 只能开 8，CUDA 上 batch 16+ 训练更快更稳；
-4. **推理侧**：4K 密集货架把 `DETECT_IMGSZ` 提到 1920（注意帧率下降）。
+1. **全データ + ラウンド増**：`--fraction 1.0 --epochs 50`（最も直接的な効果、R と mAP が共に上昇）；
+2. **より大きなモデル**：`--model yolov8s.pt`（m も）でボックスのぴったり度（mAP@50-95）を交換；
+3. **CUDA マシン**：M1 MPS では batch 8 までしか開けないが、CUDA なら batch 16+ で学習が速くて安定；
+4. **推論側**：4K 密集棚は `DETECT_IMGSZ` を 1920 まで上げる（フレームレートの低下に注意）。
 
-> 注意：检测器只决定「框的质量」，**不决定认不认得对**——认不认得对由
-> CLIP + 商品库决定（见 §11 生产化建议）。
+> 注意：デテクタは「枠の品質」だけを決定し、**認識が正しくなるかは決定しない**——認識が正しいかは
+> CLIP + 商品 DB が決める（§11 の本番運用提案参照）。
 
 ---
 
-## 9. 调试指南：出问题了先看哪里
+## 9. デバッグガイド：不具合時に最初に見る場所
 
-### 9.1 「No products detected」——一定是检测的问题
+### 9.1 「No products detected」——必ず検出の問題
 
-"检测不到" 和 "认不出" 是两回事，先用 `debug_detect.py` 分阶段定位：
+「検出されない」と「認識されない」は別物。まず `debug_detect.py` で段階的に特定する：
 
 ```bash
-python scripts/debug_detect.py data/shelf.jpg                # 默认检测器（auto）
-python scripts/debug_detect.py data/shelf.jpg --conf 0.05    # 降低阈值多检点
-python scripts/debug_detect.py data/shelf.jpg --detector coco  # 对比（通常 0 框，证明是类别问题）
-python scripts/debug_detect.py data/shelf.jpg --imgsz 1920   # 4K 密集货架提高分辨率
+python scripts/debug_detect.py data/shelf.jpg                # デフォルトデテクタ（auto）
+python scripts/debug_detect.py data/shelf.jpg --conf 0.05    # 閾値を下げて多め検出
+python scripts/debug_detect.py data/shelf.jpg --detector coco  # 比較（通常 0 枠で、クラス問題であることを示す）
+python scripts/debug_detect.py data/shelf.jpg --imgsz 1920   # 4K 密集棚の解像度を上げる
 ```
 
-它会：① 打印检到几个框**以及走的是 `specialist` 还是 `fallback` 路径**
-（0 个 → 检测器问题，按提示调 imgsz/conf/训练 custom）；
-② 把**所有**原始检测框画到 `data/debug_boxes.jpg`（直接看检测器"看到"了什么）；
-③ 若商品库非空，按与 app 完全一致的 `rank_boxes()`（含多尺度裁剪）打印每个框的
-最佳匹配 SKU + 相似度，并告诉你 `MATCH_THRESHOLD` 该调到多少（检测正常但全
-Unknown → 检索/阈值/参考图质量问题，不是检测问题）。
+このスクリプトがやること：① 検出した枠の数**と `specialist` 経路か `fallback` 経路かを出力**
+（0 個 → デテクタの問題、指示に従って imgsz/conf を調整するか custom を学習）；
+② **すべての**生検出枠を `data/debug_boxes.jpg` に描画（デテクタが「見ている」ものを直接確認）；
+③ 商品 DB が空でなければ、app と完全同一の `rank_boxes()`（マルチスケールクロップ込み）で各枠の
+最良マッチ SKU + 類似度を出力し、`MATCH_THRESHOLD` をどこに調整すべきかも教えてくれる（検出は正常なのに全
+Unknown → 検索/閾値/参照写真品質の問題で、検出の問題ではない）。
 
-#### 「手持单个商品对着摄像头，就是没有框」
+#### 「手持ちの単品をカメラに向けても枠が出ない」
 
-这是最容易误判的一类。症状与原因（见 §7.1）：
+最も誤診されやすいケース。症状と原因（§7.1 参照）：
 
-| 现象 | 含义 | 处理 |
+| 現象 | 意味 | 対応 |
 |------|------|------|
-| 0 框 | 自训 SKU-110K 模型对「单个大商品」out-of-distribution | 保持 `DETECTOR=auto`（默认）；已自动切 YOLO-World 兜底 |
-| 几十~几百个 10px 小框、最大框 <1% 画面 | 同上，是**降 conf 逼出来的幻觉框**，不是真检测 | 不要一味降 `conf`；确认 `DETECTOR` 没被设成 `custom` |
-| 有 1 个大框但标签是红色 Unknown、分数 0.55–0.65 | 检测已对，是「紧裁剪 vs 整张参考照片」的尺度不匹配 | 保持默认 `MATCH_SCALES=1.0,1.2`（§7.2） |
+| 枠 0 個 | 自学習 SKU-110K モデルにとって「大きな単品 1 個」は out-of-distribution | `DETECTOR=auto`（デフォルト）を維持；YOLO-World フォールバックへの自動切替は既に有効 |
+| 10px の小枠が数十~数百個、最大の枠が映像の <1% | 同上。**conf を下げたことで強いて出たハルシネーション枠**で、本当の検出ではない | `conf` を片端から下げるな；`DETECTOR` が `custom` に設定されていないか確認 |
+| 大きな枠が 1 個あるがラベルは赤い Unknown、スコア 0.55–0.65 | 検出は既に正しい。「ぴったりクロップ vs 参照写真まるごと」のスケール不一致 | デフォルトの `MATCH_SCALES=1.0,1.2` を維持（§7.2） |
 
-一键复现这条链路（会真的跑 CLIP 检索，需要 `data/catalog.sqlite` 里已注册该 SKU）：
+このチェーンをワンクリックで再現（実際に CLIP 検索を実行する。`data/catalog.sqlite` にその SKU が登録済みであること）：
 
 ```bash
-python scripts/test_live_closeup.py                    # 默认 ALKALINE 参考图
-python scripts/test_live_closeup.py data/crops/xxx.jpg # 换成你自己的
-python scripts/verify_detection.py                     # 批量：custom vs world vs auto
-python scripts/eval_match.py                           # 检索尺度/阈值评估
+python scripts/test_live_closeup.py                    # デフォルトは ALKALINE 参照画像
+python scripts/test_live_closeup.py data/crops/xxx.jpg # 自分のものに差し替え
+python scripts/verify_detection.py                     # バッチ：custom vs world vs auto
+python scripts/eval_match.py                           # 検索スケール/閾値の評価
 ```
 
-### 9.2 「一个商品出多个框」
+### 9.2 「1 つの商品に複数の枠が出る」
 
-训练好的单类模型会对同一商品打偏移半格的重复框（IoU≈0.4）。默认
-`DETECT_IOU=0.3` 已处理；仍有残留时用 `sweep_detect.py` 扫描
-imgsz × conf × NMS-iou 组合，并输出三个货架区域的放大对比图到 `data/sweep/`：
+学習済み単一クラスモデルは同じ商品に半セルずれた重複枠（IoU≈0.4）を出す。デフォルト
+`DETECT_IOU=0.3` で処理済み；それでも残る場合は `sweep_detect.py` で
+imgsz × conf × NMS-iou の組み合わせをスキャンし、棚領域 3 つの拡大比較図を `data/sweep/` に出力：
 
 ```bash
 python scripts/sweep_detect.py data/shelf.jpg
 ```
 
-### 9.3 其他常用命令
+### 9.3 その他の常用コマンド
 
 ```bash
-python scripts/smoke_test.py                 # 检索闭环自检（红/蓝两个假 SKU）
-python scripts/compare_detectors.py data/shelf.jpg   # 两种检测器框质量对比
+python scripts/smoke_test.py                 # 検索閉ループの自己チェック（赤/青の偽 SKU 2 つ）
+python scripts/compare_detectors.py data/shelf.jpg   # 2 つのデテクタのボックス品質比較
 ```
 
 ---
 
-## 10. 配置项（全部环境变量，`shelf_demo/config.py`）
+## 10. 設定項目（全て環境変数、`shelf_demo/config.py`）
 
-| 变量 | 默认 | 说明 |
+| 変数 | デフォルト | 説明 |
 |------|------|------|
-| `DETECTOR` | 有 `weights/sku110k_best.pt` 时 `auto`，否则 `world` | `auto` / `custom` / `world` / `coco`（§7） |
-| `DETECT_IMGSZ` | `1280` | 检测推理分辨率；4K 密集货架用 `1920` |
-| `DETECT_CONF` | `world` 0.05，否则 0.2 | 检测置信度阈值（§7 表格解释了差异原因）。`auto` 下这是**自训模型**的阈值 |
-| `DETECT_IOU` | `world` 0.5，否则 0.3 | NMS 去重阈值 |
-| `DETECT_MAX_DET` | `1000` | 单图最大框数（货架很密集） |
-| `DETECT_CLASS_AGNOSTIC` | `1` | 跨类 NMS（YOLO-World 多提示词重复框必需） |
-| `YOLO_WEIGHTS` | `weights/sku110k_best.pt`（存在时）否则 `yolov8n.pt` | `coco`/`custom` 权重路径 |
-| `YOLO_WORLD_WEIGHTS` | `yolov8s-worldv2.pt` | YOLO-World 权重路径（`auto` 的兜底模型） |
-| `YOLO_WORLD_PROMPTS` | 20 个零售/包装词（`product,package,...,object`） | 开放词表提示词（逗号分隔） |
-| `YOLO_WORLD_CONF` | `0.05` | 兜底模型自己的置信度（与 `DETECT_CONF` 解耦） |
-| `YOLO_WORLD_IOU` | `0.5` | 兜底模型自己的 NMS IoU |
-| `AUTO_COVERAGE_MIN` | `0.15` | `auto`：自训模型框并集覆盖画面 ≥ 此值才算「密集货架」（§7.1） |
-| `AUTO_MIN_AREA` | `0.01` | `auto`：自训模型最大框 ≥ 此比例才算可信 |
-| `AUTO_SWITCH_AREA` | `0.05` | `auto`：兜底模型须找到 ≥ 此比例的大物件才被采信 |
-| `CLIP_MODEL` / `CLIP_PRETRAINED` | `ViT-B-16` / `laion2b_s34b_b88k` | embedding 模型。**换模型必须重新注册所有商品**（向量空间变了）。想更强可试 `ViT-B-16-SigLIP` + `webli` |
-| `EMBED_DIM` | `512` | 向量维度（实际以加载的 CLIP 模型为准自动校正） |
-| `MATCH_THRESHOLD` | `0.65` | 余弦相似度低于此值 → Unknown（按 ViT-B-16 校准） |
-| `SEARCH_TOPK` | `5` | 每个框返回 top-k 个候选 SKU |
-| `MATCH_SCALES` | `1.0,1.2` | 查询裁剪的尺度（逗号分隔），按 SKU 取最大分；`1.0` = 关闭多尺度（§7.2） |
-| `EMBED_BATCH_SIZE` | `32` | 每次 CLIP 前向的图片数（4K 货架几百个裁剪时分块限内存） |
+| `DETECTOR` | `weights/sku110k_best.pt` 存在時 `auto`、それ以外 `world` | `auto` / `custom` / `world` / `coco`（§7） |
+| `DETECT_IMGSZ` | `1280` | 検出推論の解像度；4K 密集棚は `1920` |
+| `DETECT_CONF` | `world` で 0.05、それ以外 0.2 | 検出確信度閾値（§7 の表で差分の理由を説明）。`auto` 下ではこれは**自学習モデル**の閾値 |
+| `DETECT_IOU` | `world` で 0.5、それ以外 0.3 | NMS の重複除去閾値 |
+| `DETECT_MAX_DET` | `1000` | 画像 1 枚あたりの最大ボックス数（棚は非常に密集） |
+| `DETECT_CLASS_AGNOSTIC` | `1` | クラス横断 NMS（YOLO-World の複数プロンプトの重複枠に必須） |
+| `YOLO_WEIGHTS` | `weights/sku110k_best.pt`（存在時）、それ以外 `yolov8n.pt` | `coco`/`custom` のウェイトパス |
+| `YOLO_WORLD_WEIGHTS` | `yolov8s-worldv2.pt` | YOLO-World ウェイトパス（`auto` のフォールバックモデル） |
+| `YOLO_WORLD_PROMPTS` | 小売/パッケージ語 20 個（`product,package,...,object`） | オープンボキャブラリプロンプト（カンマ区切り） |
+| `YOLO_WORLD_CONF` | `0.05` | フォールバックモデル固有の確信度（`DETECT_CONF` と分離） |
+| `YOLO_WORLD_IOU` | `0.5` | フォールバックモデル固有の NMS IoU |
+| `AUTO_COVERAGE_MIN` | `0.15` | `auto`：自学習モデルのボックス和集合が映像の ≥ この割合をカバーして初めて「密集棚」とみなす（§7.1） |
+| `AUTO_MIN_AREA` | `0.01` | `auto`：自学習モデルの最大ボックスが ≥ この割合で初めて信頼に足す |
+| `AUTO_SWITCH_AREA` | `0.05` | `auto`：フォールバックモデルが ≥ この割合の大きな物体を見つけて初めて採用される |
+| `CLIP_MODEL` / `CLIP_PRETRAINED` | `ViT-B-16` / `laion2b_s34b_b88k` | embedding モデル。**モデル変更時は全商品の再登録が必要**（ベクトル空間が変わる）。より強ければ `ViT-B-16-SigLIP` + `webli` を試せる |
+| `EMBED_DIM` | `512` | ベクトル次元（実際にロードした CLIP モデルに合わせて自動補正） |
+| `MATCH_THRESHOLD` | `0.65` | コサイン類似度がこの値未満 → Unknown（ViT-B-16 でキャリブレーション済み） |
+| `SEARCH_TOPK` | `5` | ボックスごとに top-k の候補 SKU を返す |
+| `MATCH_SCALES` | `1.0,1.2` | クエリクロップのスケール（カンマ区切り）、SKU ごとに最高スコアを採用；`1.0` = マルチスケール無効（§7.2） |
+| `EMBED_BATCH_SIZE` | `32` | CLIP 1 フォワードあたりの画像数（4K 棚の数百クロップをチャンク分割してメモリ制限） |
 | `SHELF_DEVICE` | `auto` | `cpu` / `cuda` / `mps` |
-| `SHELF_DATA_DIR` | `./data` | 向量库/SQLite/照片的根目录 |
+| `SHELF_DATA_DIR` | `./data` | ベクトル DB / SQLite / 写真のルートディレクトリ |
 
-Live 页跟踪/表决的 env 开关（`shelf_demo/config.py`）：`SHELF_TRACKER`
-（默认 `bytetrack.yaml`；`botsort.yaml` 换其他 ultralytics tracker；
-`off` 退回旧的贪婪 IoU 匹配）、`CONFIRM_FRAMES=3` /
-`VOTE_WINDOW=5` / `VOTE_MIN=3`（SKU 表决阈值）、
-`MATCH_THRESHOLD_KEEP=0.55`（已确认标签的滞回保持阈值）、
-`REEMBED_INTERVAL=30` / `REEMBED_MAX_PER_FRAME=4`（定期复核节奏）、
-`EMBED_MAX_PER_FRAME=8`（每帧最多多少个**框**进 CLIP；未确认 track 每帧都要
-重编码，没有这个上限时「货架上商品都不在库里」会让帧率掉到 <1 FPS）。
-兜底路径的框分数普遍低于自训模型，`LiveRecognizer` 会在该帧自动把 ByteTrack
-的新建 track 阈值降到 `YOLO_WORLD_CONF`，否则框会被当成低置信框、永远建不了
-track——等于兜底白做。
-其余内置常量（`shelf_demo/live.py`，不走 env）：track 丢失容忍 `MAX_MISSES=4` 帧、
-会话空闲回收 `SESSION_TTL_S=120` 秒、前端可选 imgsz 范围 480–1536；
-抓取就绪 `GRASP_WINDOW=5` 帧 / `GRASP_IOU=0.9` / `GRASP_MAX_AGE_MS=1000` ms
-（含义见 §5.3 机械臂集成）。
-
----
-
-## 11. 关键设计决策（为什么这么写）
-
-### 11.1 向量检索为什么用 NumPy 而不是 FAISS？
-
-macOS 上 `faiss-cpu` 和 `torch` 各自打包了一份 OpenMP 运行时（libomp），
-同一进程同时加载会 `OMP: Error #15` 报错、在 Gradio 多线程服务下**偶发段错误**。
-`KMP_DUPLICATE_LIB_OK=TRUE` 只是压制报错，官方明确说"可能崩溃或静默算错"，不可靠。
-
-Demo 规模（几千个 512 维向量）的最近邻检索就是一次矩阵乘法，NumPy 亚毫秒完成、
-零原生依赖冲突。`VectorStore` 的 API 特意做成 `add / search / delete` 的
-标准向量库形态——上量级（10 万+ SKU）时直接换成 FAISS / Milvus / Qdrant
-即可，上层代码不动。
-
-### 11.2 为什么 Live 页和 Catalog 页是自研前端？
-
-- **Live**：Gradio 6 的 `gr.Image(streaming=True)` 内部状态机不可控
-  （停止按钮不复位、会话不结束，源码级确认应用层修不了）。自研后：
-  前端 canvas 独立 15 FPS 重绘（检测慢画面不卡）、generation 计数丢弃
-  停止后的迟到响应、摄像头热切换不断流。
-- **Catalog**：Gradio 原生表格放不了「照片缩略图 + 行内删除按钮」的交互，
-  用 `gr.HTML` 注入纯 JS 表格，数据走两条 JSON 路由。
-- 两者共同的坑：Gradio 的 `gr.HTML` 模板字符串里**不能出现 `${`**
-  （会被当成模板插值槽），所以 JS 一律用字符串拼接 / DOM API。
-
-### 11.3 Live 会话为什么用两把锁？
-
-`_map_lock` 保护会话 dict 本身；`model_lock` 在整个帧处理（改 track + 跑
-MPS 推理）期间持有——MPS 不接受并发推理。两把锁**绝不嵌套**，否则
-`handle_reset` 里会自死锁（初版踩过，faulthandler 定位，见设计文档）。
+Live ページの追跡/投票の env スイッチ（`shelf_demo/config.py`）：`SHELF_TRACKER`
+（デフォルト `bytetrack.yaml`；`botsort.yaml` で他の ultralytics トラッカーに切替；
+`off` で従来の貪欲 IoU マッチングに回退）、`CONFIRM_FRAMES=3` /
+`VOTE_WINDOW=5` / `VOTE_MIN=3`（SKU 投票の閾値）、
+`MATCH_THRESHOLD_KEEP=0.55`（確定済みラベルのヒステリシス保持閾値）、
+`REEMBED_INTERVAL=30` / `REEMBED_MAX_PER_FRAME=4`（定期再検証の頻度）、
+`EMBED_MAX_PER_FRAME=8`（1 フレームあたり CLIP に入る最大**枠**数；未確定トラックは毎フレーム
+再エンコードが必要で、この上限が無ければ「棚の商品が全部 DB に無い」状態でフレームレートが <1 FPS まで落ちる）。
+フォールバック経路の枠スコアは自学習モデルより全体的に低く、`LiveRecognizer` はそのフレームで
+ByteTrack の新規トラック閾値を自動的に `YOLO_WORLD_CONF` まで下げる。さもなくば枠は低確信度枠として扱われ、永遠に
+トラックが作れない——フォールバックが無駄になることになる。
+その他の組み込み定数（`shelf_demo/live.py`、env を通さない）：トラック喪失の許容 `MAX_MISSES=4` フレーム、
+セッション放置回収 `SESSION_TTL_S=120` 秒、フロントの imgsz 選択範囲 480–1536；
+grasp 準備 `GRASP_WINDOW=5` フレーム / `GRASP_IOU=0.9` / `GRASP_MAX_AGE_MS=1000` ms
+（意味は §5.3 ロボットアーム統合を参照）。
 
 ---
 
-## 12. 从 Demo 到生产：还需要做什么
+## 11. 重要な設計判断（なぜこう書いたか）
 
-这个 Demo 用**零样本 CLIP**，链路完整但细粒度 SKU 区分有限。生产系统的进阶方向：
+### 11.1 ベクトル検索は FAISS でなく NumPy なぜか？
 
-1. **微调 embedding 模型**：零样本 CLIP 在零售数据上 top-1 只有 ~40%，
-   用零售图微调后可达 ~89–92%。可换 **SigLIP / DINOv2** 作 backbone。
-2. **细粒度消歧**：同款不同规格（500ml vs 750ml）最容易翻车，
-   生产常加**第二阶段 reranker / 关键点匹配 / OCR（读包装文字）**。
-3. **向量库升级**：10 万+ SKU 换 FAISS / Milvus / Qdrant 做 ANN
-   （`VectorStore` 接口已对齐，直接替换）。
-4. **自动造标注**：用 Grounding DINO + Autodistill 零样本标注货架图，
-   再蒸馏训练小 YOLO，省人工。
-5. **VLM 兜底**：检索置信度低的 crop 送生成式 VLM（Qwen-VL / GPT-4o）二次确认。
+macOS では `faiss-cpu` と `torch` がそれぞれ OpenMP ランタイム（libomp）を 1 つずつバンドルしており、
+同一プロセスで同時にロードすると `OMP: Error #15` が報告され、Gradio のマルチスレッド配信下では**断続的にセグフォ**。
+`KMP_DUPLICATE_LIB_OK=TRUE` はエラーの抑制だけで、公式は「クラッシュするか静かに誤った計算をする可能性がある」と明言しており、信頼できない。
 
-> 生成式 VLM 目前**不是**货架识别的线上主流（成本高、延迟大、SKU 级会幻觉），
-> 主要用在"造数据"和低置信度兜底。
+Demo 規模（数千個の 512 次元ベクトル）の近傍探索は 1 回の行列積で足り、NumPy がミリ秒未満で完了し、
+ネイティブ依存の競合はゼロ。`VectorStore` の API は意図的に
+標準ベクトル DB の形態 `add / search / delete` にしている——規模が上がる（10 万+ SKU）時に FAISS / Milvus / Qdrant に
+差し替えるだけでよく、上位コードは無変更。
+
+### 11.2 Live ページと Catalog ページのフロントエンドが自作である理由
+
+- **Live**：Gradio 6 の `gr.Image(streaming=True)` は内部の状態マシンが制御不能
+  （停止ボタンがリセットされず、セッションが終了しない——ソースレベルで app レイヤでは修正不能と確認）。自作にすると：
+  フロントの canvas が独立して 15 FPS で再描画（検出が遅くても映像が滞らない）、generation カウンタで
+  停止後の遅れて着いたレスポンスを破棄、カメラのホットスワップでストリームが切れない。
+- **Catalog**：Gradio ネイティブテーブルは「写真サムネイル + 行内削除ボタン」の操作を収容できないため、
+  `gr.HTML` で純 JS テーブルを注入し、データは 2 つの JSON ルートを介する。
+- 両者共通の坑：Gradio の `gr.HTML` テンプレート文字列に**`${` が出てはならない**
+  （テンプレート補完スロットとみなされてしまう）ため、JS は一貫して文字列連結 / DOM API を使う。
+
+### 11.3 Live セッションが 2 つのロックを使う理由
+
+`_map_lock` はセッション dict 自体を保護；`model_lock` はフレーム処理全体（トラック更新 + MPS 推論
+実行）の間に保持——MPS は並行推論を受け付けない。2 つのロックは**絶対にネストしない**。さもなくば
+`handle_reset` 内で自己デッドロック（初版で踏んだ。faulthandler で特定。設計ドキュメント参照）。
 
 ---
 
-## 12.5 Eye-in-hand 机械臂抓取（RGB-D 扩展，进行中）
+## 12. Demo から本番へ：まだ必要なこと
 
-目标形态：机器狗驮机械臂在货架前抓/理商品，深度相机（RealSense）装在腕部。
-设计文档：**`docs/plans/2026-08-27-eye-in-hand-design.md`**。
-识别层（YOLO+CLIP、2D 稳定窗口）完全不动，新增几何层：
+この Demo は**ゼロショット CLIP** を使う。チェーンは完結しているが、細粒度な SKU 区別には限界がある。本番システムの発展方向：
 
-| 模块 | 职责 |
+1. **embedding モデルのファインチューニング**：ゼロショット CLIP は小売データで top-1 が ~40% しかなく、
+   小売画像でファインチューニングすると ~89–92% に到達可能。**SigLIP / DINOv2** を backbone に差し替えも可。
+2. **細粒度の曖昧性除去**：同型でスペック（容量など）が異なるもの（500ml vs 750ml）が最も壊れやすく、
+   本番では**第二段階の reranker / キーポイント（keypoint）マッチ / OCR（パッケージ文字の読み取り）**を追加するのが常。
+3. **ベクトル DB 昇格**：10 万+ SKU なら FAISS / Milvus / Qdrant に ANN を導入
+   （`VectorStore` インターフェースは既にアライメント済み、そのまま差し替え可）。
+4. **アノテーションの自動生成**：Grounding DINO + Autodistill で棚画像をゼロショットアノテーションし、
+   蒸留して小さな YOLO を学習——人手を節約。
+5. **VLM フォールバック**：検索確信度の低いクロップを生成型 VLM（Qwen-VL / GPT-4o）に渡して二次確認。
+
+> 生成型 VLM は現在、棚認識の本番運用の主流は**ではない**（コスト高、遅延大、SKU レベルでハルシネーション）、
+> 主に「データ生成」と低確信度のフォールバックに使われる。
+
+---
+
+## 12.5 Eye-in-hand ロボットアームの grasp（RGB-D 拡張、進行中）
+
+目標形態：ロボットドッグがロボットアームを背負って棚の前で商品の grasp/陳列を行い、深度カメラ（RealSense）は手首に装着。
+設計ドキュメント：**`docs/plans/2026-08-27-eye-in-hand-design.md`**。
+認識レイヤ（YOLO+CLIP、2D 安定ウィンドウ）は完全に変更なし。新規に幾何レイヤを追加：
+
+| モジュール | 責務 |
 |------|------|
-| `shelf_demo/transforms.py` | SE3 数学：变换链 `P_base = T_base_ee·T_ee_cam·P_cam` |
-| `shelf_demo/camera.py` | RealSense 采帧（深度对齐 RGB、转米、读内参） |
-| `shelf_demo/pose3d.py` | 2D 框 + 深度 → 相机系 3D 目标点（中值滤波） |
-| `shelf_demo/calibration.py` | 手眼标定：纯 numpy Park 解法（cv2≥5 删了 calibrateHandEye） |
-| `shelf_demo/rgbd_live.py` | `RGBDGraspSession.grasp3d(name)` → 米制坐标 |
-| `shelf_demo/robot.py` | `ArmBase` 接口 + `MockArm` |
+| `shelf_demo/transforms.py` | SE3 数学：変換チェーン `P_base = T_base_ee·T_ee_cam·P_cam` |
+| `shelf_demo/camera.py` | RealSense のフレーム取得（深度を RGB にアライン、メートル変換、内パラメータ読取） |
+| `shelf_demo/pose3d.py` | 2D 枠 + 深度 → カメラ座標系の 3D ターゲット点（中央値フィルタ） |
+| `shelf_demo/calibration.py` | 手眼キャリブレーション：純 numpy の Park 解法（cv2≥5 で calibrateHandEye が削除されたため） |
+| `shelf_demo/rgbd_live.py` | `RGBDGraspSession.grasp3d(name)` → メートル座標 |
+| `shelf_demo/robot.py` | `ArmBase` インターフェース + `MockArm` |
 
 ```bash
-python scripts/test_transforms.py            # SE3 数学自检（秒级，无硬件）
-python scripts/test_rgbd_grasp.py            # 全链路合成数据测试（同上）
-python scripts/calibrate_handeye.py simulate # 手眼解算自检（无硬件）
-python scripts/rs_live.py --target "可乐"     # 上机回路：实时打印目标 3D
-# 臂到货后：collect（采 10+ 组）→ solve → data/handeye.json，
-# rgbd_live 的 point_base_m 随即可用
+python scripts/test_transforms.py            # SE3 数学の自己チェック（秒オーダー、ハード不要）
+python scripts/test_rgbd_grasp.py            # 全チェーン合成データテスト（同上、秒オーダー）
+python scripts/calibrate_handeye.py simulate # 手眼キャリブレーションの自己チェック（ハード不要）
+python scripts/rs_live.py --target "コカ・コーラ"     # 実機ループ：ターゲット 3D をリアルタイム出力
+# アーム到着後：collect（10+ 組の取得）→ solve → data/handeye.json、
+# rgbd_live の point_base_m は即座に使えるようになる
 ```
 
 ---
 
-## 13. 开发与测试
+## 13. 開発とテスト
 
 ```bash
-# 抓取就绪接口（机械臂）单测：假 pipeline 驱动 LiveRecognizer，无需模型，秒级
+# grasp 準備インターフェース（ロボットアーム）の単体テスト：偽 pipeline で LiveRecognizer を駆動、モデル不要、秒オーダー
 python scripts/test_grasp.py
 
-# 检测：自训 / YOLO-World / auto 三后端在「密集货架 + 17 张单品特写」上的对比
+# 検出：自学習 / YOLO-World / auto の 3 バックエンドを「密集棚 + 単品クローズアップ 17 枚」で比較
 python scripts/verify_detection.py
-# 检索：多尺度裁剪的收益与阈值评估
+# 検索：マルチスケールクロップの効果と閾値の評価
 python scripts/eval_match.py
-# 单品特写全链路（检测→跟踪→CLIP→标签），需要 catalog 里已注册该 SKU
+# 単品クローズアップの全チェーン（検出→追跡→CLIP→ラベル）、catalog にその SKU が登録済みであること
 python scripts/test_live_closeup.py
 
-# 开发依赖（app 运行不需要）
+# 開発依存（app 実行には不要）
 pip install playwright && playwright install chromium-headless-shell
 
-# Live 页端到端：Playwright 假摄像头，验证开始/停止/重识别/帧流连续性/摄像头热切换
+# Live ページ E2E：Playwright の偽カメラで、開始/停止/再認識/フレームストリームの継続性/カメラホットスワップを検証
 python scripts/e2e_live_ui.py
 
-# Catalog 页端到端：真实注册一个测试 SKU → 验证表格渲染/缩略图/删除（含照片文件清理）
+# Catalog ページ E2E：テスト SKU を実際に登録 → テーブル描画/サムネイル/削除（写真ファイルの掃除込み）を検証
 python scripts/e2e_catalog_ui.py
 ```
 
-设计演进记录见 `docs/plans/2026-08-12-realtime-video-annotation-design.md`
-（含实测耗时表、Gradio 流媒体问题的源码级诊断）。
+設計の進化記録は `docs/plans/2026-08-12-realtime-video-annotation-design.md`
+（実測タイムテーブル、Gradio ストリーミング問題のソースレベル診断を含む）を参照。
